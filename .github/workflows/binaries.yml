@@ -13,6 +13,105 @@ env:
   PROTOC_VERSION: 27.3
 
 jobs:
+  windows:
+    strategy:
+      fail-fast: true
+      matrix:
+        config:
+          - { runner: windows-latest, protoc: win64, artifact: windows-x86_64 }
+    runs-on: ${{ matrix.config.runner }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Node + pnpm for the web UI (same as other jobs)
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.7.1
+
+      # Rust toolchain (MSVC)
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Python for PyO3
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Point PyO3 to this Python
+        shell: pwsh
+        run: echo "PYO3_PYTHON=$env:pythonLocation\python.exe" >> $env:GITHUB_ENV
+
+      # protoc (Windows)
+      - name: Install protoc compiler
+        shell: pwsh
+        run: |
+          $ver = "${{ env.PROTOC_VERSION }}"
+          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/protoc-$ver-${{ matrix.config.protoc }}.zip" -OutFile protoc.zip
+          Expand-Archive protoc.zip -DestinationPath protoc
+          echo "$pwd\protoc\bin" >> $env:GITHUB_PATH
+          # Optional: headers if needed by your build
+          echo "$pwd\protoc\include" >> $env:GITHUB_PATH
+
+      # PostgreSQL (no services on Windows runners)
+      - name: Install PostgreSQL 14
+        shell: pwsh
+        run: |
+          choco install postgresql14 --params '/Password:postgres' -y --no-progress
+          $pgBin = "C:\Program Files\PostgreSQL\14\bin"
+          echo $pgBin >> $env:GITHUB_PATH
+
+      - name: Init DB (user/db for Arroyo)
+        shell: pwsh
+        env:
+          PGPASSWORD: postgres
+        run: |
+          $pgBin = "C:\Program Files\PostgreSQL\14\bin"
+          & "$pgBin\pg_isready.exe" -h localhost -p 5432
+          & "$pgBin\psql.exe" -U postgres -h localhost -c "CREATE USER arroyo WITH PASSWORD 'arroyo' SUPERUSER;" || echo "user exists"
+          & "$pgBin\createdb.exe" -U postgres -h localhost arroyo || echo "db exists"
+
+      - name: Run DB migrations
+        shell: pwsh
+        env:
+          REFINERY_CONFIG: ${{ env.REFINERY_CONFIG }}   # postgres://arroyo:arroyo@localhost:5432/arroyo
+        run: |
+          cargo install --debug refinery_cli --version $env:REFINERY_VERSION
+          refinery migrate -e REFINERY_CONFIG -p crates/arroyo-api/migrations
+
+      - name: Build frontend
+        shell: pwsh
+        run: |
+          cd webui
+          pnpm install
+          pnpm build
+
+      - name: Create output directory
+        shell: pwsh
+        run: mkdir artifacts
+
+      - name: Build Arroyo with Python
+        shell: pwsh
+        run: |
+          cargo build --features python --release --package arroyo
+          Copy-Item target\release\arroyo.exe artifacts\arroyo-python.exe
+
+      - name: Build Arroyo without Python
+        shell: pwsh
+        run: |
+          cargo build --release --package arroyo
+          Copy-Item target\release\arroyo.exe artifacts\arroyo.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arroyo-${{ matrix.config.artifact }}
+          path: artifacts/*
+          if-no-files-found: error
   linux:
     strategy:
       fail-fast: true
