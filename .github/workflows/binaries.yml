@@ -43,11 +43,20 @@ jobs:
           Expand-Archive protoc.zip -DestinationPath protoc
           echo "$pwd\protoc\bin" >> $env:GITHUB_PATH
 
+      # 🔧 MSVC env (fixes 'nmake not found' and C compiler errors)
+      - name: Enable MSVC build tools
+        uses: ilammy/msvc-dev-cmd@v1
+        with: { arch: x64 }
+      
+      - name: Set CC to cl
+        shell: pwsh
+        run: echo "CC=cl" >> $env:GITHUB_ENV
+
       # Install PostgreSQL (Windows)
       - name: Install PostgreSQL 14
         shell: pwsh
         run: |
-          choco install postgresql14 -y --no-progress
+          choco install postgresql14 cmake ninja -y --no-progress
           echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
 
       # Make localhost auth "trust" so we can bootstrap roles/db without a password
@@ -82,7 +91,7 @@ jobs:
             & "$pgBin\createdb.exe" -U postgres -h 127.0.0.1 arroyo
           }
           & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -c "ALTER USER postgres WITH PASSWORD 'arroyo';"
-          
+
       # Run DB migrations (uses your existing env string)
       - name: Run DB migrations
         shell: pwsh
@@ -106,13 +115,13 @@ jobs:
       - name: Build Arroyo with Python
         shell: pwsh
         run: |
-          cargo build --features python --release --package arroyo
+          cargo build --release --package arroyo --no-default-features --features "python"
           Copy-Item target\release\arroyo.exe artifacts\arroyo-python.exe
 
       - name: Build Arroyo without Python
         shell: pwsh
         run: |
-          cargo build --release --package arroyo
+          cargo build --release --package arroyo --no-default-features
           Copy-Item target\release\arroyo.exe artifacts\arroyo.exe
 
       - uses: actions/upload-artifact@v4
