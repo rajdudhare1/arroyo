@@ -44,23 +44,10 @@ jobs:
           echo "$pwd\protoc\bin" >> $env:GITHUB_PATH
 
       # PostgreSQL with a known password for 'postgres'
-      - name: Install PostgreSQL 14
+      - name: Start Postgres container
         shell: pwsh
         run: |
-          choco install postgresql14 --params '/Password:arroyo' -y --no-progress
-          echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
-
-      # Create user/db (idempotent), force IPv4 to avoid ::1 auth quirks
-      - name: Init DB (user/db for Arroyo)
-        shell: pwsh
-        env:
-          PGPASSWORD: arroyo
-        run: |
-          $pgBin = "C:\Program Files\PostgreSQL\14\bin"
-          & "$pgBin\pg_isready.exe" -h 127.0.0.1 -p 5432
-          & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -c "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='arroyo') THEN CREATE ROLE arroyo LOGIN PASSWORD 'arroyo' SUPERUSER; END IF; END $$;"
-          $dbExists = & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='arroyo'"
-          if (-not $dbExists) { & "$pgBin\createdb.exe" -U postgres -h 127.0.0.1 arroyo }
+          docker run -d --name pg-arroyo -e POSTGRES_USER=arroyo -e POSTGRES_PASSWORD=arroyo -e POSTGRES_DB=arroyo -p 5432:5432 postgres:14
 
       - name: Run DB migrations
         shell: pwsh
