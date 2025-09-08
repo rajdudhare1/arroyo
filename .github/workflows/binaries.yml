@@ -14,72 +14,58 @@ env:
 
 jobs:
   windows:
-    strategy:
-      fail-fast: true
-      matrix:
-        config:
-          - { runner: windows-latest, protoc: win64, artifact: windows-x86_64 }
-    runs-on: ${{ matrix.config.runner }}
+    runs-on: windows-latest
     steps:
-      - name: Check out
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # Node + pnpm for the web UI (same as other jobs)
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9.7.1
+      # Node + pnpm (same as other jobs)
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: pnpm/action-setup@v4
+        with: { version: 9.7.1 }
 
-      # Rust toolchain (MSVC)
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      # Rust
+      - uses: dtolnay/rust-toolchain@stable
 
       # Python for PyO3
-      - name: Setup Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
       - name: Point PyO3 to this Python
         shell: pwsh
         run: echo "PYO3_PYTHON=$env:pythonLocation\python.exe" >> $env:GITHUB_ENV
 
-      # protoc (Windows)
+      # protoc
       - name: Install protoc compiler
         shell: pwsh
         run: |
           $ver = "${{ env.PROTOC_VERSION }}"
-          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/protoc-$ver-${{ matrix.config.protoc }}.zip" -OutFile protoc.zip
+          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/protoc-$ver-win64.zip" -OutFile protoc.zip
           Expand-Archive protoc.zip -DestinationPath protoc
           echo "$pwd\protoc\bin" >> $env:GITHUB_PATH
-          # Optional: headers if needed by your build
-          echo "$pwd\protoc\include" >> $env:GITHUB_PATH
 
-      # PostgreSQL (no services on Windows runners)
+      # PostgreSQL with a known password for 'postgres'
       - name: Install PostgreSQL 14
         shell: pwsh
         run: |
-          choco install postgresql14 --params '/Password:postgres' -y --no-progress
-          $pgBin = "C:\Program Files\PostgreSQL\14\bin"
-          echo $pgBin >> $env:GITHUB_PATH
+          choco install postgresql14 --params '/Password:arroyo' -y --no-progress
+          echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
 
+      # Create user/db (idempotent), force IPv4 to avoid ::1 auth quirks
       - name: Init DB (user/db for Arroyo)
         shell: pwsh
         env:
-          PGPASSWORD: postgres
+          PGPASSWORD: arroyo
         run: |
           $pgBin = "C:\Program Files\PostgreSQL\14\bin"
-          & "$pgBin\pg_isready.exe" -h localhost -p 5432
-          & "$pgBin\psql.exe" -U postgres -h localhost -c "CREATE USER arroyo WITH PASSWORD 'arroyo' SUPERUSER;" || echo "user exists"
-          & "$pgBin\createdb.exe" -U postgres -h localhost arroyo || echo "db exists"
+          & "$pgBin\pg_isready.exe" -h 127.0.0.1 -p 5432
+          & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -c "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='arroyo') THEN CREATE ROLE arroyo LOGIN PASSWORD 'arroyo' SUPERUSER; END IF; END $$;"
+          $dbExists = & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='arroyo'"
+          if (-not $dbExists) { & "$pgBin\createdb.exe" -U postgres -h 127.0.0.1 arroyo }
 
       - name: Run DB migrations
         shell: pwsh
         env:
-          REFINERY_CONFIG: ${{ env.REFINERY_CONFIG }}   # postgres://arroyo:arroyo@localhost:5432/arroyo
+          REFINERY_CONFIG: postgres://arroyo:arroyo@localhost:5432/arroyo
         run: |
           cargo install --debug refinery_cli --version $env:REFINERY_VERSION
           refinery migrate -e REFINERY_CONFIG -p crates/arroyo-api/migrations
@@ -109,7 +95,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: arroyo-${{ matrix.config.artifact }}
+          name: arroyo-windows-x86_64
           path: artifacts/*
           if-no-files-found: error
   linux:
