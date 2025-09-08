@@ -112,16 +112,22 @@ jobs:
         shell: pwsh
         run: mkdir artifacts
 
+      - name: Diagnose deps (Windows)
+        shell: pwsh
+        run: |
+          cargo tree --manifest-path crates/arroyo/Cargo.toml -i tikv-jemalloc-sys -e features || $true
+          cargo tree --manifest-path crates/arroyo/Cargo.toml -i rdkafka-sys -e features || $true
+
       - name: Build Arroyo with Python
         shell: pwsh
         run: |
-          cargo build --release --package arroyo --no-default-features --features "python"
+          cargo build --manifest-path crates/arroyo/Cargo.toml --release --no-default-features --features "python"
           Copy-Item target\release\arroyo.exe artifacts\arroyo-python.exe
 
       - name: Build Arroyo without Python
         shell: pwsh
         run: |
-          cargo build --release --package arroyo --no-default-features
+          cargo build --manifest-path crates/arroyo/Cargo.toml --release --no-default-features
           Copy-Item target\release\arroyo.exe artifacts\arroyo.exe
 
       - uses: actions/upload-artifact@v4
@@ -135,7 +141,7 @@ jobs:
       matrix:
         # see https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#standard-github-hosted-runners-for-public-repositories
         config:
-          - { runner: ubuntu-22.04-32, protoc: linux-x86_64, pyarch: x86_64, artifact: linux-x86_64 }
+          - { runner: ubuntu-latest, protoc: linux-x86_64, pyarch: x86_64, artifact: linux-x86_64 }
           - { runner: ubuntu-22.04-32-arm, protoc: linux-aarch_64, pyarch: aarch64, artifact: linux-arm64 }
     runs-on: ${{ matrix.config.runner }}
     services:
