@@ -47,6 +47,11 @@ jobs:
           echo "AR=x86_64-w64-mingw32-ar" >> $env:GITHUB_ENV
           echo "PKG_CONFIG_PATH=/mingw64/lib/pkgconfig" >> $env:GITHUB_ENV
 
+      - name: Add MSYS2 mingw64/bin to PATH
+        shell: pwsh
+        run: |
+          echo "C:\tools\msys64\mingw64\bin" >> $env:GITHUB_PATH
+          
       # Python for PyO3
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
