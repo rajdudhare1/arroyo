@@ -14,6 +14,20 @@ env:
 
 jobs:
   windows:
+    services:
+      postgres:
+        image: postgres:14.13-alpine3.20
+        env:
+          POSTGRES_USER: arroyo
+          POSTGRES_PASSWORD: arroyo
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +65,7 @@ jobs:
         shell: pwsh
         run: |
           echo "C:\tools\msys64\mingw64\bin" >> $env:GITHUB_PATH
-          
+
       # Python for PyO3
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
@@ -76,46 +90,6 @@ jobs:
       - name: Set CC to cl
         shell: pwsh
         run: echo "CC=cl" >> $env:GITHUB_ENV
-
-      # Install PostgreSQL (Windows)
-      - name: Install PostgreSQL 14
-        shell: pwsh
-        run: |
-          choco install postgresql14 cmake ninja -y --no-progress
-          echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
-
-      # Make localhost auth "trust" so we can bootstrap roles/db without a password
-      - name: Configure pg_hba for trust (local)
-        shell: pwsh
-        run: |
-          $dataDir = "C:\Program Files\PostgreSQL\14\data"
-          $hba = Join-Path $dataDir "pg_hba.conf"
-          # Prepend trust rules for IPv4/IPv6 localhost
-          $trust = @(
-            "host    all             all             127.0.0.1/32            trust",
-            "host    all             all             ::1/128                 trust"
-          )
-          $orig = Get-Content $hba
-          Set-Content -Path $hba -Value ($trust + $orig)
-          net stop postgresql-x64-14
-          net start postgresql-x64-14
-          Start-Sleep -Seconds 10
-
-      # Create arroyo superuser + DB (idempotent) and optionally set postgres password
-      - name: Init DB (user/db for Arroyo)
-        shell: pwsh
-        run: |
-          $pgBin = "C:\Program Files\PostgreSQL\14\bin"
-          & "$pgBin\pg_isready.exe" -h 127.0.0.1 -p 5432
-          $roleExists = & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='arroyo'"
-          if (-not $roleExists) {
-            & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -c "CREATE ROLE arroyo LOGIN PASSWORD 'arroyo' SUPERUSER;"
-          }
-          $dbExists = & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='arroyo'"
-          if (-not $dbExists) {
-            & "$pgBin\createdb.exe" -U postgres -h 127.0.0.1 arroyo
-          }
-          & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -c "ALTER USER postgres WITH PASSWORD 'arroyo';"
 
       # Run DB migrations (uses your existing env string)
       - name: Run DB migrations
