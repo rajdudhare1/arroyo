@@ -26,6 +26,26 @@ jobs:
 
       # Rust
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install MSYS2 and build tools
+        run: |
+          choco install msys2 -y --no-progress
+          refreshenv
+          C:\tools\msys64\usr\bin\bash -lc "pacman -Syu --noconfirm"
+          C:\tools\msys64\usr\bin\bash -lc "pacman -S --noconfirm base-devel mingw-w64-x86_64-toolchain \
+            mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja \
+            mingw-w64-x86_64-nasm mingw-w64-x86_64-pkg-config \
+            autoconf automake libtool"
+
+      - name: Set GNU build env
+        shell: pwsh
+        run: |
+          echo "CC=x86_64-w64-mingw32-gcc" >> $env:GITHUB_ENV
+          echo "CXX=x86_64-w64-mingw32-g++" >> $env:GITHUB_ENV
+          echo "AR=x86_64-w64-mingw32-ar" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/mingw64/lib/pkgconfig" >> $env:GITHUB_ENV
 
       # Python for PyO3
       - uses: actions/setup-python@v5
@@ -117,6 +137,11 @@ jobs:
         run: |
           cargo tree --manifest-path crates/arroyo/Cargo.toml -i tikv-jemalloc-sys -e features || $true
           cargo tree --manifest-path crates/arroyo/Cargo.toml -i rdkafka-sys -e features || $true
+        
+      - name: Build Arroyo (GNU)
+        run: |
+          cargo build --release --target x86_64-pc-windows-gnu --package arroyo
+          Copy-Item target\x86_64-pc-windows-gnu\release\arroyo.exe artifacts\arroyo.exe
 
       - name: Build Arroyo with Python
         shell: pwsh
