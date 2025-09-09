@@ -116,13 +116,18 @@ jobs:
           & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -c "ALTER USER postgres WITH PASSWORD 'arroyo';"
 
       # Run DB migrations (uses your existing env string)
-      - name: Run DB migrations
+      - name: Install refinery_cli (MSVC) and run migrations
         shell: pwsh
         env:
           REFINERY_CONFIG: postgres://arroyo:arroyo@localhost:5432/arroyo
         run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc
+          rustup default stable-x86_64-pc-windows-msvc
           cargo install --debug refinery_cli --version $env:REFINERY_VERSION
           refinery migrate -e REFINERY_CONFIG -p crates/arroyo-api/migrations
+          # switch back to GNU for your main build:
+          rustup toolchain install stable-x86_64-pc-windows-gnu
+          rustup default stable-x86_64-pc-windows-gnu
 
       - name: Build frontend
         shell: pwsh
