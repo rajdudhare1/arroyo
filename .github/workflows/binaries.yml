@@ -104,6 +104,16 @@ jobs:
       - name: Create artifacts directory
         run: mkdir artifacts
 
+      - name: Export vcpkg include/lib to MSVC search path
+        shell: pwsh
+        run: |
+          # Append vcpkg OpenSSL to INCLUDE/LIB so MSVC's cl/link can find headers/libs
+          $env:INCLUDE = "$env:INCLUDE;C:\vcpkg\installed\x64-windows\include"
+          $env:LIB     = "$env:LIB;C:\vcpkg\installed\x64-windows\lib"
+          # Persist for later steps
+          'INCLUDE='+$env:INCLUDE | Out-File -FilePath $env:GITHUB_ENV -Append
+          'LIB='+$env:LIB         | Out-File -FilePath $env:GITHUB_ENV -Append
+
       # Build Arroyo with Python (MSVC + vcpkg libs)
       - name: Build Arroyo with Python
         shell: pwsh
@@ -123,6 +133,8 @@ jobs:
           ZSTD_DIR:            C:\vcpkg\installed\x64-windows
           ZSTD_INCLUDE_DIR:    C:\vcpkg\installed\x64-windows\include
           ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
+          SASL2_OPENSSL_INCLUDE: C:\vcpkg\installed\x64-windows\include
+          SASL2_OPENSSL_LIBPATH: C:\vcpkg\installed\x64-windows\lib
         run: |
           $env:PYO3_PYTHON = "${{ env.pythonLocation }}\python.exe"
           cargo build --features python --release --package arroyo --target ${{ matrix.config.build_target }}
@@ -146,6 +158,8 @@ jobs:
           ZSTD_DIR:            C:\vcpkg\installed\x64-windows
           ZSTD_INCLUDE_DIR:    C:\vcpkg\installed\x64-windows\include
           ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
+          SASL2_OPENSSL_INCLUDE: C:\vcpkg\installed\x64-windows\include
+          SASL2_OPENSSL_LIBPATH: C:\vcpkg\installed\x64-windows\lib
         run: |
           cargo build -p arroyo --release -vv
           Copy-Item target\release\arroyo.exe artifacts\arroyo.exe
