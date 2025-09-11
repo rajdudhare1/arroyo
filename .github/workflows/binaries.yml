@@ -14,7 +14,13 @@ env:
 
 jobs:
   windows:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # see https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#standard-github-hosted-runners-for-public-repositories
+        config:
+          - { runner: windows-latest, protoc: windows-x86_64, pyarch: x86_64, artifact: windows-x86_64 }
+    runs-on: ${{ matrix.config.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -79,8 +85,16 @@ jobs:
       - name: Install PostgreSQL 14
         shell: pwsh
         run: |
-          choco install postgresql14 cmake ninja -y --no-progress
+          choco install postgresql14 cmake ninja nasm strawberryperl -y --no-progress
           echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
+          & C:\vcpkg\vcpkg.exe integrate install
+          & C:\vcpkg\vcpkg.exe install cyrus-sasl:x64-windows zstd:x64-windows openssl:x64-windows
+          & C:\vcpkg\vcpkg.exe list
+          Write-Host "=== SASL libs ==="
+          dir "C:\vcpkg\installed\x64-windows\lib\*sasl*.lib"
+          Write-Host "=== SASL headers ==="
+          dir "C:\vcpkg\installed\x64-windows\include\sasl"
+          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
 
       # Make localhost auth "trust" so we can bootstrap roles/db without a password
       - name: Configure pg_hba for trust (local)
@@ -125,9 +139,9 @@ jobs:
           rustup default stable-x86_64-pc-windows-msvc
           cargo install --debug refinery_cli --version $env:REFINERY_VERSION
           refinery migrate -e REFINERY_CONFIG -p crates/arroyo-api/migrations
-          # switch back to GNU for your main build:
-          rustup toolchain install stable-x86_64-pc-windows-gnu
-          rustup default stable-x86_64-pc-windows-gnu
+          # # switch back to GNU for your main build:
+          # rustup toolchain install stable-x86_64-pc-windows-gnu
+          # rustup default stable-x86_64-pc-windows-gnu
 
       - name: Build frontend
         shell: pwsh
@@ -146,21 +160,55 @@ jobs:
           cargo tree --manifest-path crates/arroyo/Cargo.toml -i tikv-jemalloc-sys -e features || $true
           cargo tree --manifest-path crates/arroyo/Cargo.toml -i rdkafka-sys -e features || $true
         
-      - name: Build Arroyo (GNU)
-        run: |
-          cargo build --release --target x86_64-pc-windows-gnu --package arroyo
-          Copy-Item target\x86_64-pc-windows-gnu\release\arroyo.exe artifacts\arroyo.exe
+      # - name: Build Arroyo (GNU)
+      #   run: |
+      #     cargo build --release --target x86_64-pc-windows-gnu --package arroyo
+      #     Copy-Item target\x86_64-pc-windows-gnu\release\arroyo.exe artifacts\arroyo.exe
 
       - name: Build Arroyo with Python
         shell: pwsh
+        env:
+            OPENSSL_DIR:        C:\vcpkg\installed\x64-windows
+            OPENSSL_ROOT_DIR:   C:\vcpkg\installed\x64-windows
+            OPENSSL_LIB_DIR:    C:\vcpkg\installed\x64-windows\lib
+            OPENSSL_INCLUDE_DIR: C:\vcpkg\installed\x64-windows\include
+            RUST_BACKTRACE: "1"
+            CMAKE_TOOLCHAIN_FILE: C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+            VCPKG_ROOT: C:\vcpkg
+            VCPKG_DEFAULT_TRIPLET: x64-windows
+            VCPKG_TARGET_TRIPLET:  x64-windows
+            SASL2_DIR:        C:\vcpkg\installed\x64-windows
+            SASL2_INCLUDE_DIR: C:\vcpkg\installed\x64-windows\include
+            SASL2_LIB_DIR:    C:\vcpkg\installed\x64-windows\lib
+            ZSTD_DIR:         C:\vcpkg\installed\x64-windows
+            ZSTD_INCLUDE_DIR: C:\vcpkg\installed\x64-windows\include
+            ZSTD_LIB_DIR:     C:\vcpkg\installed\x64-windows\lib
+            OPENSSL_NO_VENDOR: ""   # let openssl-sys build its own
         run: |
-          cargo build --manifest-path crates/arroyo/Cargo.toml --release --no-default-features --features "python"
+          cargo build -p arroyo --release --features "python" -vv
           Copy-Item target\release\arroyo.exe artifacts\arroyo-python.exe
 
       - name: Build Arroyo without Python
         shell: pwsh
+        env:
+            OPENSSL_DIR:        C:\vcpkg\installed\x64-windows
+            OPENSSL_ROOT_DIR:   C:\vcpkg\installed\x64-windows
+            OPENSSL_LIB_DIR:    C:\vcpkg\installed\x64-windows\lib
+            OPENSSL_INCLUDE_DIR: C:\vcpkg\installed\x64-windows\include
+            RUST_BACKTRACE: "1"
+            CMAKE_TOOLCHAIN_FILE: C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+            VCPKG_ROOT: C:\vcpkg
+            VCPKG_DEFAULT_TRIPLET: x64-windows
+            VCPKG_TARGET_TRIPLET:  x64-windows
+            SASL2_DIR:        C:\vcpkg\installed\x64-windows
+            SASL2_INCLUDE_DIR: C:\vcpkg\installed\x64-windows\include
+            SASL2_LIB_DIR:    C:\vcpkg\installed\x64-windows\lib
+            ZSTD_DIR:         C:\vcpkg\installed\x64-windows
+            ZSTD_INCLUDE_DIR: C:\vcpkg\installed\x64-windows\include
+            ZSTD_LIB_DIR:     C:\vcpkg\installed\x64-windows\lib
+            OPENSSL_NO_VENDOR: ""   # let openssl-sys build its own
         run: |
-          cargo build --manifest-path crates/arroyo/Cargo.toml --release --no-default-features
+          cargo build -p arroyo --release  -vv
           Copy-Item target\release\arroyo.exe artifacts\arroyo.exe
 
       - uses: actions/upload-artifact@v4
