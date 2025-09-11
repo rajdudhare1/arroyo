@@ -11,6 +11,21 @@ env:
   REFINERY_CONFIG: postgres://arroyo:arroyo@localhost:5432/arroyo
   REFINERY_VERSION: 0.8.14
   PROTOC_VERSION: 27.3
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+  PNPM_VERSION: "9.7.1"
+
+  # Postgres related
+  POSTGRES_USER: arroyo
+  POSTGRES_PASSWORD: arroyo
+  POSTGRES_DB: arroyo
+  POSTGRES_HOST: localhost
+
+  # Cargo build optimizations
+  CARGO_PROFILE_RELEASE_LTO: "thin"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+  CARGO_PROFILE_RELEASE_STRIP: true
+
 
 jobs:
   windows:
@@ -18,46 +33,49 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - { runner: windows-latest, protoc: windows-x86_64, pyarch: x86_64, artifact: windows-x86_64 }
+          - { runner: windows-latest, protoc: win64, pyarch: x86_64, artifact: windows-x86_64, build_target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.config.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out
+        uses: actions/checkout@v5
 
-      # Node + pnpm
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - uses: pnpm/action-setup@v4
-        with: { version: 9.7.1 }
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.config.build_target }}
 
-      # Rust (MSVC only)
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ matrix.config.artifact }}
 
-      # protoc
-      - name: Install protoc compiler
-        shell: pwsh
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }} with caching
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      - name: Setup protoc compiler
         run: |
-          $ver = "${{ env.PROTOC_VERSION }}"
-          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/protoc-$ver-win64.zip" -OutFile protoc.zip
-          Expand-Archive protoc.zip -DestinationPath protoc
-          echo "$pwd\protoc\bin" >> $env:GITHUB_PATH
+          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v${{ env.PROTOC_VERSION }}/protoc-${{ env.PROTOC_VERSION }}-${{ matrix.config.protoc }}.zip" -OutFile protoc.zip
+          Expand-Archive -Path protoc.zip -DestinationPath .
+          echo "PROTOC=$($PWD.Path)\bin\protoc.exe" >> $env:GITHUB_ENV
 
-      # Enable MSVC build tools
-      - name: Enable MSVC build tools
-        uses: ilammy/msvc-dev-cmd@v1
-        with: { arch: x64 }
-
-      # Python for PyO3
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.12' }
-      - name: Point PyO3 to this Python
-        shell: pwsh
-        run: echo "PYO3_PYTHON=$env:pythonLocation\python.exe" >> $env:GITHUB_ENV
-
-      # PostgreSQL + vcpkg libs needed by rdkafka (SASL/ZSTD/OPENSSL)
-      - name: Install PostgreSQL + native deps
-        shell: pwsh
+      - name: Setup PostgreSQL
         run: |
-          choco install postgresql14 cmake ninja nasm strawberryperl -y --no-progress
+          choco install postgresql14 --version=14.13 cmake ninja nasm strawberryperl -y --no-progress
           echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
           & C:\vcpkg\vcpkg.exe integrate install
           & C:\vcpkg\vcpkg.exe install cyrus-sasl:x64-windows zstd:x64-windows openssl:x64-windows
@@ -66,58 +84,24 @@ jobs:
           dir "C:\vcpkg\installed\x64-windows\lib\*sasl*.lib"
           Write-Host "=== SASL headers ==="
           dir "C:\vcpkg\installed\x64-windows\include\sasl"
+          echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
+          Start-Process -FilePath "C:\Program Files\PostgreSQL\14\bin\pg_ctl.exe" -ArgumentList "start -D 'C:\ProgramData\PostgreSQL\14\data'" -Wait
 
-      # Trust local connections so we can create role/db
-      - name: Configure pg_hba for trust (local)
-        shell: pwsh
+      - name: Prepare PostgreSQL Database
         run: |
-          $dataDir = "C:\Program Files\PostgreSQL\14\data"
-          $hba = Join-Path $dataDir "pg_hba.conf"
-          $trust = @(
-            "host    all             all             127.0.0.1/32            trust",
-            "host    all             all             ::1/128                 trust"
-          )
-          $orig = Get-Content $hba
-          Set-Content -Path $hba -Value ($trust + $orig)
-          net stop postgresql-x64-14
-          net start postgresql-x64-14
           Start-Sleep -Seconds 10
+          & "psql.exe" -U postgres -c "CREATE USER ${{ env.POSTGRES_USER }} WITH PASSWORD '${{ env.POSTGRES_PASSWORD }}' SUPERUSER;"
+          & "createdb.exe" -U postgres ${{ env.POSTGRES_DB }}
 
-      - name: Init DB (user/db for Arroyo)
-        shell: pwsh
+      - name: Run DB migrations
         run: |
-          $pgBin = "C:\Program Files\PostgreSQL\14\bin"
-          & "$pgBin\pg_isready.exe" -h 127.0.0.1 -p 5432
-          $roleExists = & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='arroyo'"
-          if (-not $roleExists) {
-            & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -c "CREATE ROLE arroyo LOGIN PASSWORD 'arroyo' SUPERUSER;"
-          }
-          $dbExists = & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='arroyo'"
-          if (-not $dbExists) {
-            & "$pgBin\createdb.exe" -U postgres -h 127.0.0.1 arroyo
-          }
-          & "$pgBin\psql.exe" -U postgres -h 127.0.0.1 -d postgres -c "ALTER USER postgres WITH PASSWORD 'arroyo';"
-
-      # Install refinery_cli (MSVC) and run migrations
-      - name: Install refinery_cli and migrate
-        shell: pwsh
-        env:
-          REFINERY_CONFIG: ${{ env.REFINERY_CONFIG }}
-        run: |
-          # ensure no mingw vars leak into MSVC builds
-          Remove-Item Env:CC,Env:CXX,Env:AR,Env:PKG_CONFIG_PATH -ErrorAction SilentlyContinue
-          cargo install --debug refinery_cli --version $env:REFINERY_VERSION
+          cargo install --debug refinery_cli --version ${{ env.REFINERY_VERSION }}
           refinery migrate -e REFINERY_CONFIG -p crates/arroyo-api/migrations
 
-      - name: Build frontend
-        shell: pwsh
-        run: |
-          cd webui
-          pnpm install
-          pnpm build
+      - name: Run frontend build
+        run: cd webui && pnpm install && pnpm build
 
-      - name: Create output directory
-        shell: pwsh
+      - name: Create artifacts directory
         run: mkdir artifacts
 
       # Build Arroyo with Python (MSVC + vcpkg libs)
@@ -140,8 +124,9 @@ jobs:
           ZSTD_INCLUDE_DIR:    C:\vcpkg\installed\x64-windows\include
           ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
         run: |
-          cargo build -p arroyo --release --features "python" -vv
-          Copy-Item target\release\arroyo.exe artifacts\arroyo-python.exe
+          $env:PYO3_PYTHON = "${{ env.pythonLocation }}\python.exe"
+          cargo build --features python --release --package arroyo --target ${{ matrix.config.build_target }}
+          Move-Item "target\${{ matrix.config.build_target }}\release\arroyo.exe" "artifacts\arroyo-python.exe"
 
       - name: Build Arroyo without Python
         shell: pwsh
