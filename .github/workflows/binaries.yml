@@ -73,7 +73,9 @@ jobs:
           Expand-Archive -Path protoc.zip -DestinationPath .
           echo "PROTOC=$($PWD.Path)\bin\protoc.exe" >> $env:GITHUB_ENV
 
-      - name: Setup PostgreSQL
+      # Install PostgreSQL + build deps
+      - name: Setup PostgreSQL + build tools
+        shell: pwsh
         run: |
           $env:PATH += ";C:\ProgramData\chocolatey\bin"
           choco install postgresql14 --version=14.13 cmake ninja nasm strawberryperl -y --no-progress
@@ -87,15 +89,32 @@ jobs:
           dir "C:\vcpkg\installed\x64-windows\include\sasl"
           echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
           Start-Process -FilePath "C:\Program Files\PostgreSQL\14\bin\pg_ctl.exe" -ArgumentList "start -D 'C:\ProgramData\PostgreSQL\14\data'" -Wait
-          $nasm = (Get-Command nasm.exe -ErrorAction Stop).Source
-          Write-Host "NASM=$nasm"
+
+      # Ensure NASM is discoverable for aws-lc / OpenSSL
+      - name: Setup NASM explicitly
+        shell: pwsh
+        run: |
+          $cands = @(
+            "C:\ProgramData\chocolatey\bin\nasm.exe",
+            "C:\Program Files\NASM\nasm.exe"
+          )
+          try {
+            $w = & where.exe nasm 2>$null | Select-Object -First 1
+            if ($w) { $cands += $w }
+          } catch {}
+          $nasm = $cands | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $nasm) { throw "NASM not found after install" }
+          Write-Host "Using NASM at $nasm"
+          & $nasm -v
           "CMAKE_ASM_NASM_COMPILER=$nasm" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "NASM_EXECUTABLE=$nasm"         | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PATH=$([System.IO.Path]::GetDirectoryName($nasm));$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Prepare PostgreSQL Database
         run: |
           Start-Sleep -Seconds 10
-          & "psql.exe" -U postgres -c "CREATE USER ${{ env.POSTGRES_USER }} WITH PASSWORD '${{ env.POSTGRES_PASSWORD }}' SUPERUSER;"
-          & "createdb.exe" -U postgres ${{ env.POSTGRES_DB }}
+          & "psql.exe" -U postgres -c "CREATE USER ${{ env.POSTGRES_USER }} WITH PASSWORD '${{ env.POSTGRES_PASSWORD }}' SUPERUSER;" || echo "user exists"
+          & "createdb.exe" -U postgres ${{ env.POSTGRES_DB }} || echo "db exists"
 
       - name: Run DB migrations
         run: |
@@ -108,17 +127,21 @@ jobs:
       - name: Create artifacts directory
         run: mkdir artifacts
 
+      # Ensure MSVC sees vcpkg headers/libs
       - name: Export vcpkg include/lib to MSVC search path
         shell: pwsh
         run: |
-          # Append vcpkg OpenSSL to INCLUDE/LIB so MSVC's cl/link can find headers/libs
           $env:INCLUDE = "$env:INCLUDE;C:\vcpkg\installed\x64-windows\include"
           $env:LIB     = "$env:LIB;C:\vcpkg\installed\x64-windows\lib"
-          # Persist for later steps
           'INCLUDE='+$env:INCLUDE | Out-File -FilePath $env:GITHUB_ENV -Append
           'LIB='+$env:LIB         | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      # Build Arroyo with Python (MSVC + vcpkg libs)
+      # Clean any leftover GNU env vars
+      - name: Clean GNU vars
+        shell: pwsh
+        run: |
+          Remove-Item Env:CC,Env:CXX,Env:AR,Env:PKG_CONFIG_PATH -ErrorAction SilentlyContinue
+
       - name: Build Arroyo with Python
         shell: pwsh
         env:
@@ -137,9 +160,6 @@ jobs:
           ZSTD_DIR:            C:\vcpkg\installed\x64-windows
           ZSTD_INCLUDE_DIR:    C:\vcpkg\installed\x64-windows\include
           ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
-          SASL2_OPENSSL_INCLUDE: C:\vcpkg\installed\x64-windows\include
-          SASL2_OPENSSL_LIBPATH: C:\vcpkg\installed\x64-windows\lib
-          CMAKE_ASM_NASM_COMPILER: C:\ProgramData\chocolatey\bin\nasm.exe
         run: |
           $env:PYO3_PYTHON = "${{ env.pythonLocation }}\python.exe"
           cargo build --features python --release --package arroyo --target ${{ matrix.config.build_target }}
@@ -163,9 +183,6 @@ jobs:
           ZSTD_DIR:            C:\vcpkg\installed\x64-windows
           ZSTD_INCLUDE_DIR:    C:\vcpkg\installed\x64-windows\include
           ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
-          SASL2_OPENSSL_INCLUDE: C:\vcpkg\installed\x64-windows\include
-          SASL2_OPENSSL_LIBPATH: C:\vcpkg\installed\x64-windows\lib
-          CMAKE_ASM_NASM_COMPILER: C:\ProgramData\chocolatey\bin\nasm.exe
         run: |
           cargo build -p arroyo --release -vv
           Copy-Item target\release\arroyo.exe artifacts\arroyo.exe
@@ -174,7 +191,7 @@ jobs:
         with:
           name: arroyo-windows-x86_64
           path: artifacts/*
-          if-no-files-found: error  
+          if-no-files-found: error
   linux:
     strategy:
       fail-fast: true
