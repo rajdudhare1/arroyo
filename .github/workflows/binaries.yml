@@ -75,6 +75,7 @@ jobs:
 
       - name: Setup PostgreSQL
         run: |
+          $env:PATH += ";C:\ProgramData\chocolatey\bin"
           choco install postgresql14 --version=14.13 cmake ninja nasm strawberryperl -y --no-progress
           echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
           & C:\vcpkg\vcpkg.exe integrate install
@@ -138,7 +139,7 @@ jobs:
           ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
           SASL2_OPENSSL_INCLUDE: C:\vcpkg\installed\x64-windows\include
           SASL2_OPENSSL_LIBPATH: C:\vcpkg\installed\x64-windows\lib
-          CMAKE_ASM_NASM_COMPILER: C:\Program Files\NASM\nasm.exe
+          CMAKE_ASM_NASM_COMPILER: C:\ProgramData\chocolatey\bin\nasm.exe
         run: |
           $env:PYO3_PYTHON = "${{ env.pythonLocation }}\python.exe"
           cargo build --features python --release --package arroyo --target ${{ matrix.config.build_target }}
@@ -164,7 +165,7 @@ jobs:
           ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
           SASL2_OPENSSL_INCLUDE: C:\vcpkg\installed\x64-windows\include
           SASL2_OPENSSL_LIBPATH: C:\vcpkg\installed\x64-windows\lib
-          CMAKE_ASM_NASM_COMPILER: C:\Program Files\NASM\nasm.exe
+          CMAKE_ASM_NASM_COMPILER: C:\ProgramData\chocolatey\bin\nasm.exe
         run: |
           cargo build -p arroyo --release -vv
           Copy-Item target\release\arroyo.exe artifacts\arroyo.exe
