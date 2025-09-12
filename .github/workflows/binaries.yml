@@ -86,6 +86,9 @@ jobs:
           dir "C:\vcpkg\installed\x64-windows\include\sasl"
           echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
           Start-Process -FilePath "C:\Program Files\PostgreSQL\14\bin\pg_ctl.exe" -ArgumentList "start -D 'C:\ProgramData\PostgreSQL\14\data'" -Wait
+          $nasm = (Get-Command nasm.exe -ErrorAction Stop).Source
+          Write-Host "NASM=$nasm"
+          "CMAKE_ASM_NASM_COMPILER=$nasm" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Prepare PostgreSQL Database
         run: |
@@ -135,6 +138,7 @@ jobs:
           ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
           SASL2_OPENSSL_INCLUDE: C:\vcpkg\installed\x64-windows\include
           SASL2_OPENSSL_LIBPATH: C:\vcpkg\installed\x64-windows\lib
+          CMAKE_ASM_NASM_COMPILER: C:\Program Files\NASM\nasm.exe
         run: |
           $env:PYO3_PYTHON = "${{ env.pythonLocation }}\python.exe"
           cargo build --features python --release --package arroyo --target ${{ matrix.config.build_target }}
@@ -160,6 +164,7 @@ jobs:
           ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
           SASL2_OPENSSL_INCLUDE: C:\vcpkg\installed\x64-windows\include
           SASL2_OPENSSL_LIBPATH: C:\vcpkg\installed\x64-windows\lib
+          CMAKE_ASM_NASM_COMPILER: C:\Program Files\NASM\nasm.exe
         run: |
           cargo build -p arroyo --release -vv
           Copy-Item target\release\arroyo.exe artifacts\arroyo.exe
