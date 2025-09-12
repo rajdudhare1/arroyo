@@ -91,21 +91,48 @@ jobs:
           Start-Process -FilePath "C:\Program Files\PostgreSQL\14\bin\pg_ctl.exe" -ArgumentList "start -D 'C:\ProgramData\PostgreSQL\14\data'" -Wait
 
       # Ensure NASM is discoverable for aws-lc / OpenSSL
-      - name: Setup NASM explicitly
+      - name: Setup NASM explicitly (robust)
         shell: pwsh
         run: |
-          $cands = @(
-            "C:\ProgramData\chocolatey\bin\nasm.exe",
-            "C:\Program Files\NASM\nasm.exe"
+          # Candidate locations (common on GH runners)
+          $roots = @(
+            "C:\ProgramData\chocolatey\bin",
+            "C:\ProgramData\chocolatey\lib\nasm\tools",
+            "C:\Program Files\NASM"
           )
-          try {
-            $w = & where.exe nasm 2>$null | Select-Object -First 1
-            if ($w) { $cands += $w }
-          } catch {}
-          $nasm = $cands | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-          if (-not $nasm) { throw "NASM not found after install" }
+
+          # Search recursively for nasm.exe in known roots
+          $found = @()
+          foreach ($r in $roots) {
+            if (Test-Path $r) {
+              $found += Get-ChildItem -Path $r -Filter nasm.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            }
+          }
+
+          # Fallback: ask the system (in case Chocolatey added a shim to PATH already)
+          if (-not $found) {
+            try {
+              $w = & where.exe nasm 2>$null | Select-Object -First 1
+              if ($w) {
+                $obj = [PSCustomObject]@{ FullName = $w }
+                $found += $obj
+              }
+            } catch {}
+          }
+
+          if (-not $found) {
+            Write-Host "Could not locate nasm.exe in common locations. Listing Chocolatey tree for hints:"
+            if (Test-Path "C:\ProgramData\chocolatey\lib\nasm") {
+              Get-ChildItem -Path "C:\ProgramData\chocolatey\lib\nasm" -Recurse | Select-Object FullName | Out-Host
+            }
+            throw "NASM not found after install"
+          }
+
+          $nasm = $found[0].FullName
           Write-Host "Using NASM at $nasm"
-          & $nasm -v
+          & "$nasm" -v
+
+          # Make it visible to subsequent steps
           "CMAKE_ASM_NASM_COMPILER=$nasm" | Out-File -FilePath $env:GITHUB_ENV -Append
           "NASM_EXECUTABLE=$nasm"         | Out-File -FilePath $env:GITHUB_ENV -Append
           "PATH=$([System.IO.Path]::GetDirectoryName($nasm));$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Append
