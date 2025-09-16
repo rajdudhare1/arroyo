@@ -78,7 +78,7 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH += ";C:\ProgramData\chocolatey\bin"
-          choco install postgresql14 --version=14.13 cmake ninja nasm strawberryperl -y --no-progress
+          choco install postgresql14 --version=14.13 cmake pkgconfiglite ninja nasm strawberryperl -y --no-progress
           echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
           & C:\vcpkg\vcpkg.exe integrate install
           & C:\vcpkg\vcpkg.exe install cyrus-sasl:x64-windows zstd:x64-windows openssl:x64-windows
@@ -130,6 +130,10 @@ jobs:
 
       - name: Create artifacts directory
         run: mkdir artifacts
+
+      - name: Enable MSVC build tools
+        uses: ilammy/msvc-dev-cmd@v1
+        with: { arch: x64 }
 
       # Ensure MSVC sees vcpkg headers/libs
       - name: Export vcpkg include/lib to MSVC search path
