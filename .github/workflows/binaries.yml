@@ -179,7 +179,8 @@ jobs:
         with:
           name: arroyo-windows-x86_64
           path: artifacts/*
-          if-no-files-found: errorlinux:
+          if-no-files-found: error
+  linux:
     strategy:
       fail-fast: true
       matrix:
