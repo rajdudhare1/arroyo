@@ -44,7 +44,7 @@ jobs:
         with:
           targets: ${{ matrix.config.build_target }}
 
-      - name: Setup Rust cache
+      - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: ${{ matrix.config.artifact }}
@@ -68,86 +68,89 @@ jobs:
           cache-dependency-path: webui/pnpm-lock.yaml
 
       - name: Setup protoc compiler
+        shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v${{ env.PROTOC_VERSION }}/protoc-${{ env.PROTOC_VERSION }}-${{ matrix.config.protoc }}.zip" -OutFile protoc.zip
           Expand-Archive -Path protoc.zip -DestinationPath .
-          echo "PROTOC=$($PWD.Path)\bin\protoc.exe" >> $env:GITHUB_ENV
+          "PROTOC=$($PWD.Path)\bin\protoc.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      # Install PostgreSQL + build deps
-      - name: Setup PostgreSQL + build tools
+      # MSVC toolchain in PATH (cl, link, nmake)
+      - name: Enable MSVC build tools
+        uses: ilammy/msvc-dev-cmd@v1
+        with: { arch: x64 }
+
+      # Install Postgres and vcpkg libs (OpenSSL, SASL, ZSTD)
+      - name: Setup PostgreSQL + vcpkg deps
         shell: pwsh
         run: |
           $env:PATH += ";C:\ProgramData\chocolatey\bin"
-          choco install postgresql14 --version=14.13 cmake ninja nasm strawberryperl -y --no-progress
-          echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
+          choco install postgresql14 --version=14.13 cmake ninja strawberryperl pkgconfiglite -y --no-progress
+          "C:\Program Files\PostgreSQL\14\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
           & C:\vcpkg\vcpkg.exe integrate install
-          & C:\vcpkg\vcpkg.exe install cyrus-sasl:x64-windows zstd:x64-windows openssl:x64-windows
+          & C:\vcpkg\vcpkg.exe install openssl:x64-windows cyrus-sasl:x64-windows zstd:x64-windows
           & C:\vcpkg\vcpkg.exe list
+
           Write-Host "=== SASL libs ==="
           dir "C:\vcpkg\installed\x64-windows\lib\*sasl*.lib"
           Write-Host "=== SASL headers ==="
           dir "C:\vcpkg\installed\x64-windows\include\sasl"
-          echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
-          Start-Process -FilePath "C:\Program Files\PostgreSQL\14\bin\pg_ctl.exe" -ArgumentList "start -D 'C:\ProgramData\PostgreSQL\14\data'" -Wait
 
-      # Ensure NASM is discoverable for aws-lc / OpenSSL
-      - name: Install NASM (fallback, portable)
+      # Export vcpkg into compiler & pkg-config search paths
+      - name: Export vcpkg env (MSVC + pkg-config)
         shell: pwsh
         run: |
-          $ver    = "2.16.03"   # stable, x64
-          $zipUrl = "https://www.nasm.us/pub/nasm/releasebuilds/$ver/win64/nasm-$ver-win64.zip"
-          $dest   = "$env:RUNNER_TEMP\nasm.zip"
-          $outDir = "$env:RUNNER_TEMP\nasm-$ver"
+          # Ensure no mingw artifacts bleed into MSVC build
+          Remove-Item Env:AR,Env:CC,Env:CXX -ErrorAction SilentlyContinue
 
-          Write-Host "Downloading NASM $ver from $zipUrl"
-          Invoke-WebRequest -Uri $zipUrl -OutFile $dest
-          Expand-Archive -Path $dest -DestinationPath $outDir -Force
+          # pkg-config should point at vcpkg
+          'PKG_CONFIG_PATH=C:\vcpkg\installed\x64-windows\lib\pkgconfig' | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          # Find nasm.exe inside the expanded tree
-          $nasm = Get-ChildItem -Path $outDir -Filter nasm.exe -Recurse -ErrorAction Stop | Select-Object -First 1
-          if (-not $nasm) { throw "NASM not found in $outDir after download" }
+          # OpenSSL via vcpkg (no vendored, no NASM)
+          'OPENSSL_NO_VENDOR=1'                                  | Out-File -FilePath $env:GITHUB_ENV -Append
+          'OPENSSL_DIR=C:\vcpkg\installed\x64-windows'           | Out-File -FilePath $env:GITHUB_ENV -Append
+          'OPENSSL_LIB_DIR=C:\vcpkg\installed\x64-windows\lib'   | Out-File -FilePath $env:GITHUB_ENV -Append
+          'OPENSSL_INCLUDE_DIR=C:\vcpkg\installed\x64-windows\include' | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          Write-Host "Using NASM at $($nasm.FullName)"
-          & "$($nasm.FullName)" -v
+          # Force sasl2-sys to use pkg-config (avoid vendored nmake)
+          'SASL2_SYS_USE_PKG_CONFIG=1'                           | Out-File -FilePath $env:GITHUB_ENV -Append
+          'SASL2_DIR=C:\vcpkg\installed\x64-windows'             | Out-File -FilePath $env:GITHUB_ENV -Append
+          'SASL2_INCLUDE_DIR=C:\vcpkg\installed\x64-windows\include' | Out-File -FilePath $env:GITHUB_ENV -Append
+          'SASL2_LIB_DIR=C:\vcpkg\installed\x64-windows\lib'     | Out-File -FilePath $env:GITHUB_ENV -Append
 
-          # Export for later steps (CMake will pick these up)
-          "CMAKE_ASM_NASM_COMPILER=$($nasm.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "NASM_EXECUTABLE=$($nasm.FullName)"         | Out-File -FilePath $env:GITHUB_ENV -Append
-          "PATH=$($nasm.DirectoryName);$env:PATH"     | Out-File -FilePath $env:GITHUB_ENV -Append
+          # Help cl/link find headers/libs
+          'INCLUDE='+$env:INCLUDE+';C:\vcpkg\installed\x64-windows\include' | Out-File -FilePath $env:GITHUB_ENV -Append
+          'LIB='+$env:LIB+';C:\vcpkg\installed\x64-windows\lib'             | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Prepare PostgreSQL Database
+          # Sanity check pkg-config
+          pkg-config --version
+          pkg-config --modversion libsasl2
+          pkg-config --cflags --libs libsasl2
+          pkg-config --modversion openssl
+
+      - name: Start PostgreSQL and prepare DB
+        shell: pwsh
         run: |
+          Start-Process -FilePath "C:\Program Files\PostgreSQL\14\bin\pg_ctl.exe" -ArgumentList "start -D 'C:\ProgramData\PostgreSQL\14\data'" -Wait
           Start-Sleep -Seconds 10
           & "psql.exe" -U postgres -c "CREATE USER ${{ env.POSTGRES_USER }} WITH PASSWORD '${{ env.POSTGRES_PASSWORD }}' SUPERUSER;" || echo "user exists"
           & "createdb.exe" -U postgres ${{ env.POSTGRES_DB }} || echo "db exists"
 
       - name: Run DB migrations
+        shell: pwsh
         run: |
           cargo install --debug refinery_cli --version ${{ env.REFINERY_VERSION }}
           refinery migrate -e REFINERY_CONFIG -p crates/arroyo-api/migrations
 
-      - name: Run frontend build
-        run: cd webui && pnpm install && pnpm build
+      - name: Build frontend
+        shell: pwsh
+        run: cd webui; pnpm install; pnpm build
 
       - name: Create artifacts directory
+        shell: pwsh
         run: mkdir artifacts
 
-      # Ensure MSVC sees vcpkg headers/libs
-      - name: Export vcpkg include/lib to MSVC search path
-        shell: pwsh
-        run: |
-          $env:INCLUDE = "$env:INCLUDE;C:\vcpkg\installed\x64-windows\include"
-          $env:LIB     = "$env:LIB;C:\vcpkg\installed\x64-windows\lib"
-          'INCLUDE='+$env:INCLUDE | Out-File -FilePath $env:GITHUB_ENV -Append
-          'LIB='+$env:LIB         | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      # Clean any leftover GNU env vars
-      - name: Clean GNU vars
-        shell: pwsh
-        run: |
-          Remove-Item Env:CC,Env:CXX,Env:AR,Env:PKG_CONFIG_PATH -ErrorAction SilentlyContinue
-
-      - name: Build Arroyo with Python
+      - name: Build Arroyo with Python (MSVC)
         shell: pwsh
         env:
           RUST_BACKTRACE: "1"
@@ -155,22 +158,12 @@ jobs:
           VCPKG_ROOT: C:\vcpkg
           VCPKG_DEFAULT_TRIPLET: x64-windows
           VCPKG_TARGET_TRIPLET:  x64-windows
-          OPENSSL_DIR:         C:\vcpkg\installed\x64-windows
-          OPENSSL_ROOT_DIR:    C:\vcpkg\installed\x64-windows
-          OPENSSL_LIB_DIR:     C:\vcpkg\installed\x64-windows\lib
-          OPENSSL_INCLUDE_DIR: C:\vcpkg\installed\x64-windows\include
-          SASL2_DIR:           C:\vcpkg\installed\x64-windows
-          SASL2_INCLUDE_DIR:   C:\vcpkg\installed\x64-windows\include
-          SASL2_LIB_DIR:       C:\vcpkg\installed\x64-windows\lib
-          ZSTD_DIR:            C:\vcpkg\installed\x64-windows
-          ZSTD_INCLUDE_DIR:    C:\vcpkg\installed\x64-windows\include
-          ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
         run: |
           $env:PYO3_PYTHON = "${{ env.pythonLocation }}\python.exe"
-          cargo build --features python --release --package arroyo --target ${{ matrix.config.build_target }}
+          cargo build --features python --release --package arroyo --target ${{ matrix.config.build_target }} -vv
           Move-Item "target\${{ matrix.config.build_target }}\release\arroyo.exe" "artifacts\arroyo-python.exe"
 
-      - name: Build Arroyo without Python
+      - name: Build Arroyo without Python (MSVC)
         shell: pwsh
         env:
           RUST_BACKTRACE: "1"
@@ -178,16 +171,6 @@ jobs:
           VCPKG_ROOT: C:\vcpkg
           VCPKG_DEFAULT_TRIPLET: x64-windows
           VCPKG_TARGET_TRIPLET:  x64-windows
-          OPENSSL_DIR:         C:\vcpkg\installed\x64-windows
-          OPENSSL_ROOT_DIR:    C:\vcpkg\installed\x64-windows
-          OPENSSL_LIB_DIR:     C:\vcpkg\installed\x64-windows\lib
-          OPENSSL_INCLUDE_DIR: C:\vcpkg\installed\x64-windows\include
-          SASL2_DIR:           C:\vcpkg\installed\x64-windows
-          SASL2_INCLUDE_DIR:   C:\vcpkg\installed\x64-windows\include
-          SASL2_LIB_DIR:       C:\vcpkg\installed\x64-windows\lib
-          ZSTD_DIR:            C:\vcpkg\installed\x64-windows
-          ZSTD_INCLUDE_DIR:    C:\vcpkg\installed\x64-windows\include
-          ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
         run: |
           cargo build -p arroyo --release -vv
           Copy-Item target\release\arroyo.exe artifacts\arroyo.exe
@@ -196,8 +179,7 @@ jobs:
         with:
           name: arroyo-windows-x86_64
           path: artifacts/*
-          if-no-files-found: error
-  linux:
+          if-no-files-found: errorlinux:
     strategy:
       fail-fast: true
       matrix:
@@ -260,7 +242,6 @@ jobs:
           name: arroyo-${{ matrix.config.artifact }}
           path: artifacts/*
           if-no-files-found: error
-
   macos:
     strategy:
       fail-fast: true
