@@ -293,7 +293,7 @@ async fn details(State(state): State<Arc<AdminState>>) -> String {
     }))
     .unwrap()
 }
-
+#[cfg(not(target_env = "msvc"))]
 pub async fn handle_get_heap() -> Result<impl IntoResponse, (StatusCode, String)> {
     let mut prof_ctl = jemalloc_pprof::PROF_CTL.as_ref().unwrap().lock().await;
     require_profiling_activated(&prof_ctl)?;
@@ -304,6 +304,7 @@ pub async fn handle_get_heap() -> Result<impl IntoResponse, (StatusCode, String)
 }
 
 /// Checks whether jemalloc profiling is activated an returns an error response if not.
+#[cfg(not(target_env = "msvc"))]
 fn require_profiling_activated(
     prof_ctl: &jemalloc_pprof::JemallocProfCtl,
 ) -> Result<(), (StatusCode, String)> {

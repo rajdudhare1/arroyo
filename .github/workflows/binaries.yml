@@ -51,7 +51,6 @@ jobs:
           cache-on-failure: true
           cache-all-crates: true
           cache-workspace-crates: true
-          cache-target: true
 
       - name: Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5

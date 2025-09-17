@@ -166,6 +166,7 @@ impl Shutdown {
             tokio::spawn(async move {
                 loop {
                     let ctrl_c = tokio::signal::ctrl_c();
+                    #[cfg(unix)]
                     let signal = async {
                         let mut os_signal = tokio::signal::unix::signal(
                             tokio::signal::unix::SignalKind::terminate(),
@@ -176,6 +177,7 @@ impl Shutdown {
 
                     select! {
                         _ = ctrl_c => {}
+                        #[cfg(unix)]
                         _ = signal => {}
                     }
 
