@@ -1,6 +1,7 @@
 use futures::future::OptionFuture;
 use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::process::exit;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -166,19 +167,26 @@ impl Shutdown {
             tokio::spawn(async move {
                 loop {
                     let ctrl_c = tokio::signal::ctrl_c();
-                    #[cfg(unix)]
-                    let signal = async {
-                        let mut os_signal = tokio::signal::unix::signal(
-                            tokio::signal::unix::SignalKind::terminate(),
-                        )?;
-                        os_signal.recv().await;
-                        io::Result::Ok(())
-                    };
-
-                    select! {
-                        _ = ctrl_c => {}
+                    let sigterm_future: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send>>> = {
                         #[cfg(unix)]
-                        _ = signal => {}
+                        {
+                            use tokio::signal::unix::{signal, SignalKind};
+                            Some(Box::pin(async {
+                                let mut stream = signal(SignalKind::terminate())?;
+                                stream.recv().await;
+                                Ok(())
+                            }))
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            None
+                        }
+                    };
+                    select! {
+                        _ = ctrl_c => {},
+                        Some(res) = OptionFuture::from(sigterm_future) => {
+                            let _ = res;
+                        }
                     }
 
                     if matches!(signal_behavior, SignalBehavior::Ignore) {
