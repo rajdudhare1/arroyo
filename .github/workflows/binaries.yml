@@ -94,7 +94,7 @@ jobs:
           $env:PATH += ";C:\ProgramData\chocolatey\bin"
           choco install cmake pkgconfiglite ninja nasm strawberryperl  -y --no-progress
           & C:\vcpkg\vcpkg.exe integrate install
-          & C:\vcpkg\vcpkg.exe install cyrus-sasl:x64-windows zstd:x64-windows openssl:x64-windows
+          & C:\vcpkg\vcpkg.exe install cyrus-sasl:x64-windows zstd:x64-windows openssl:x64-windows zlib:x64-windows
           & C:\vcpkg\vcpkg.exe list
           Write-Host "=== SASL libs ==="
           dir "C:\vcpkg\installed\x64-windows\lib\*sasl*.lib"
@@ -161,6 +161,9 @@ jobs:
           $env:LIB     = "$env:LIB;C:\vcpkg\installed\x64-windows\lib"
           'INCLUDE='+$env:INCLUDE | Out-File -FilePath $env:GITHUB_ENV -Append
           'LIB='+$env:LIB         | Out-File -FilePath $env:GITHUB_ENV -Append
+          'ZLIB_ROOT=C:\vcpkg\installed\x64-windows'              | Out-File -FilePath $env:GITHUB_ENV -Append
+          'ZLIB_INCLUDE_DIR=C:\vcpkg\installed\x64-windows\include' | Out-File -FilePath $env:GITHUB_ENV -Append
+          'ZLIB_LIB_DIR=C:\vcpkg\installed\x64-windows\lib'         | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # Clean any leftover GNU env vars
       - name: Clean GNU vars
@@ -189,7 +192,7 @@ jobs:
           ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
         run: |
           $env:PYO3_PYTHON = "${{ env.pythonLocation }}\python.exe"
-          echo $env:CMAKE_POLICY_VERSION_MINIMUM
+          echo $env:ZLIB_ROOT
           cargo build --features python --release --package arroyo --target ${{ matrix.config.build_target }}
           Move-Item "target\${{ matrix.config.build_target }}\release\arroyo.exe" "artifacts\arroyo-python.exe"
 
