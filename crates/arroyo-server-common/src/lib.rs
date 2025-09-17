@@ -1,6 +1,6 @@
 #![allow(clippy::type_complexity)]
 
-#[cfg(not(windows))]
+#[cfg(not(target_env = "msvc"))]
 mod profile;
 pub mod shutdown;
 pub mod tls;
@@ -15,7 +15,7 @@ use axum::routing::get;
 use axum::Router;
 use lazy_static::lazy_static;
 use once_cell::sync::OnceCell;
-#[cfg(not(windows))]
+#[cfg(not(target_env = "msvc"))]
 use profile::handle_get_profile;
 use prometheus::{register_int_counter, Encoder, IntCounter, ProtobufEncoder, TextEncoder};
 use reqwest::Client;
@@ -332,15 +332,14 @@ pub async fn start_admin_server(service: &str) -> anyhow::Result<()> {
     .route("/details", get(details))
     .route("/config", get(config_route));
 
-        
-    #[cfg(not(windows))]
+#[cfg(not(target_env = "msvc"))]
     {
         app = app
             .route("/debug/pprof/heap", get(handle_get_heap))
             .route("/debug/pprof/profile", get(handle_get_profile));
     }
 
-    let app = app.with_state(state);
+    let mut app = app.with_state(state);
 
     if let ApiAuthMode::StaticApiKey { api_key } = &config.admin.auth_mode {
         app = app.layer(ValidateRequestHeaderLayer::bearer(api_key));
