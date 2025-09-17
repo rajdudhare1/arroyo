@@ -28,11 +28,8 @@ env:
 
   # Rust settings
   RUST_BACKTRACE: "1"
-  RUSTFLAGS: "-C link-arg=/VERBOSE:LIB"
 
-  # Build Settings
-  CMAKE_ARGS: "-DWITH_ZLIB=OFF"
-
+  CMAKE_TOOLCHAIN_FILE: C:\vcpkg\scripts\buildsystems\vcpkg.cmake
 
 jobs:
   windows:
@@ -156,9 +153,9 @@ jobs:
       - name: Diagnose deps (Windows)
         shell: pwsh
         run: |
-          cargo tree -i tikv-jemalloc-sys -e features || $true
-          cargo tree -i jemalloc_pprof -e features || $true
-          cargo tree -i pprof -e features || $true
+          cargo tree -i tikv-jemalloc-sys -e features --target all || $true
+          cargo tree -i jemalloc_pprof -e features --target all || $true
+          cargo tree -i pprof -e features --target all || $true
 
       # Ensure MSVC sees vcpkg headers/libs
       - name: Export vcpkg include/lib to MSVC search path
@@ -177,6 +174,14 @@ jobs:
         shell: pwsh
         run: |
           Remove-Item Env:CC,Env:CXX,Env:AR,Env:PKG_CONFIG_PATH -ErrorAction SilentlyContinue
+
+      - name: Inspect librdkafka CMake configure
+        shell: pwsh
+        run: |
+          # Force a manual configure to see what it's detecting
+          mkdir tmp-rdkafka
+          cd tmp-rdkafka
+          cmake ..\c:\vcpkg\buildtrees\librdkafka\src\* -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake -A x64 -DWITH_ZLIB=ON -DOPENSSL_ROOT_DIR=C:\vcpkg\installed\x64-windows
 
       - name: Build Arroyo with Python
         shell: pwsh
