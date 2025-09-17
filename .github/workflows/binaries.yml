@@ -48,6 +48,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: ${{ matrix.config.artifact }}
+          cache-on-failure: true
+          cache-all-crates: true
+          cache-workspace-crates: true
+          cache-target: true
 
       - name: Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
@@ -78,8 +82,18 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH += ";C:\ProgramData\chocolatey\bin"
-          choco install postgresql14 --version=14.13 cmake pkgconfiglite ninja nasm strawberryperl -y --no-progress
+          choco install postgresql14 --version=14.13 -y --no-progress
           echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
+          
+          echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
+          Start-Process -FilePath "C:\Program Files\PostgreSQL\14\bin\pg_ctl.exe" -ArgumentList "start -D 'C:\ProgramData\PostgreSQL\14\data'" -Wait
+
+      # Install build deps
+      - name: Setup build tools
+        shell: pwsh
+        run: |
+          $env:PATH += ";C:\ProgramData\chocolatey\bin"
+          choco install cmake pkgconfiglite ninja nasm strawberryperl  -y --no-progress
           & C:\vcpkg\vcpkg.exe integrate install
           & C:\vcpkg\vcpkg.exe install cyrus-sasl:x64-windows zstd:x64-windows openssl:x64-windows
           & C:\vcpkg\vcpkg.exe list
@@ -87,8 +101,6 @@ jobs:
           dir "C:\vcpkg\installed\x64-windows\lib\*sasl*.lib"
           Write-Host "=== SASL headers ==="
           dir "C:\vcpkg\installed\x64-windows\include\sasl"
-          echo "C:\Program Files\PostgreSQL\14\bin" >> $env:GITHUB_PATH
-          Start-Process -FilePath "C:\Program Files\PostgreSQL\14\bin\pg_ctl.exe" -ArgumentList "start -D 'C:\ProgramData\PostgreSQL\14\data'" -Wait
 
       # Ensure NASM is discoverable for aws-lc / OpenSSL
       - name: Install NASM (direct zip)
@@ -200,6 +212,7 @@ jobs:
           name: arroyo-windows-x86_64
           path: artifacts/*
           if-no-files-found: error
+          
   linux:
     strategy:
       fail-fast: true
