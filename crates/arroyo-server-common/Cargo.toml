@@ -42,7 +42,6 @@ webpki-roots = { workspace = true }
 
 # profile
 flate2 = "1.0.30"
-pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }
 serde = { version = "1.0.96", features = ["derive"] }
 
 [build-dependencies]
@@ -50,3 +49,4 @@ vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }
 
 [target.'cfg(not(windows))'.dependencies]
 jemalloc_pprof = "0.7.0"
+pprof = { version = "0.15.0", features = ["flamegraph", "protobuf-codec"] }

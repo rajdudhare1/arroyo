@@ -78,7 +78,7 @@ jobs:
           echo "PROTOC=$($PWD.Path)\bin\protoc.exe" >> $env:GITHUB_ENV
 
       # Install PostgreSQL + build deps
-      - name: Setup PostgreSQL + build tools
+      - name: Setup PostgreSQL 14
         shell: pwsh
         run: |
           $env:PATH += ";C:\ProgramData\chocolatey\bin"
@@ -147,6 +147,13 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with: { arch: x64 }
 
+      - name: Diagnose deps (Windows)
+        shell: pwsh
+        run: |
+          cargo tree -i tikv-jemalloc-sys -e features || $true
+          cargo tree -i jemalloc_pprof -e features || $true
+          cargo tree -i pprof -e features || $true
+
       # Ensure MSVC sees vcpkg headers/libs
       - name: Export vcpkg include/lib to MSVC search path
         shell: pwsh
@@ -212,7 +219,7 @@ jobs:
           name: arroyo-windows-x86_64
           path: artifacts/*
           if-no-files-found: error
-          
+
   linux:
     strategy:
       fail-fast: true
