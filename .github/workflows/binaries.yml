@@ -172,6 +172,7 @@ jobs:
       - name: Build Arroyo with Python
         shell: pwsh
         env:
+          CMAKE_POLICY_VERSION_MINIMUM: 3.5
           RUST_BACKTRACE: "1"
           CMAKE_TOOLCHAIN_FILE: C:\vcpkg\scripts\buildsystems\vcpkg.cmake
           VCPKG_ROOT: C:\vcpkg
@@ -189,12 +190,14 @@ jobs:
           ZSTD_LIB_DIR:        C:\vcpkg\installed\x64-windows\lib
         run: |
           $env:PYO3_PYTHON = "${{ env.pythonLocation }}\python.exe"
+          echo $env:CMAKE_POLICY_VERSION_MINIMUM
           cargo build --features python --release --package arroyo --target ${{ matrix.config.build_target }}
           Move-Item "target\${{ matrix.config.build_target }}\release\arroyo.exe" "artifacts\arroyo-python.exe"
 
       - name: Build Arroyo without Python
         shell: pwsh
         env:
+          CMAKE_POLICY_VERSION_MINIMUM: 3.5
           RUST_BACKTRACE: "1"
           CMAKE_TOOLCHAIN_FILE: C:\vcpkg\scripts\buildsystems\vcpkg.cmake
           VCPKG_ROOT: C:\vcpkg
@@ -219,7 +222,6 @@ jobs:
           name: arroyo-windows-x86_64
           path: artifacts/*
           if-no-files-found: error
-
   linux:
     strategy:
       fail-fast: true
