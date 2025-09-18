@@ -175,14 +175,6 @@ jobs:
         run: |
           Remove-Item Env:CC,Env:CXX,Env:AR,Env:PKG_CONFIG_PATH -ErrorAction SilentlyContinue
 
-      - name: Inspect librdkafka CMake configure
-        shell: pwsh
-        run: |
-          # Force a manual configure to see what it's detecting
-          mkdir tmp-rdkafka
-          cd tmp-rdkafka
-          cmake ..\c:\vcpkg\buildtrees\librdkafka\src\* -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake -A x64 -DWITH_ZLIB=ON -DOPENSSL_ROOT_DIR=C:\vcpkg\installed\x64-windows
-
       - name: Build Arroyo with Python
         shell: pwsh
         env:
