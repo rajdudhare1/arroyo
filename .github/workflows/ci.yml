@@ -119,7 +119,7 @@ jobs:
           cargo nextest run --package integ -E 'kind(test)'
           
   build-console:
-    runs-on: ubuntu-latest
+    runs-on: 22.04-32
     steps:
       - name: Check out
         uses: actions/checkout@v3
