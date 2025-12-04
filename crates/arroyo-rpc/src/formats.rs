@@ -269,12 +269,13 @@ impl AvroFormat {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ParquetCompression {
-    #[default]
     Uncompressed,
     Snappy,
     Gzip,
+    #[default]
     Zstd,
     Lz4,
+    Lz4Raw,
 }
 
 impl FromStr for ParquetCompression {
@@ -287,6 +288,7 @@ impl FromStr for ParquetCompression {
             "gzip" => ParquetCompression::Gzip,
             "zstd" => ParquetCompression::Zstd,
             "lz4" => ParquetCompression::Lz4,
+            "lz4_raw" => ParquetCompression::Lz4Raw,
             _ => {
                 return plan_err!("invalid parquet compression '{s}'");
             }
@@ -294,7 +296,9 @@ impl FromStr for ParquetCompression {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, ToSchema)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, ToSchema, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub struct ParquetFormat {
     #[serde(default)]

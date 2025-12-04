@@ -1,26 +1,26 @@
 use super::{
     local::{CurrentFileRecovery, FilePreCommit, LocalWriter},
-    BatchBufferingWriter, MultiPartWriterStats,
+    BatchBufferingWriter, FsEventLogger, MultiPartWriterStats,
 };
 use crate::filesystem::config;
-use crate::filesystem::sink::iceberg::add_parquet_field_ids;
 use crate::filesystem::sink::iceberg::metadata::IcebergFileMetadata;
-use anyhow::Result;
-use arrow::{
-    array::{Array, RecordBatch, StringArray, TimestampNanosecondArray},
-    compute::{sort_to_indices, take},
+use crate::filesystem::sink::iceberg::schema::{
+    normalize_batch_to_schema, update_field_ids_to_iceberg,
 };
+use anyhow::Result;
+use arrow::array::{Array, RecordBatch, TimestampNanosecondArray};
+use arrow::datatypes::SchemaRef;
 use arroyo_rpc::formats::{ParquetCompression, ParquetFormat};
 use arroyo_rpc::{df::ArroyoSchemaRef, formats::Format};
 use arroyo_types::from_nanos;
 use bytes::{BufMut, Bytes, BytesMut};
-use datafusion::physical_plan::PhysicalExpr;
 use parquet::{
     arrow::ArrowWriter,
     basic::{GzipLevel, ZstdLevel},
     file::properties::WriterProperties,
 };
 use std::sync::Mutex;
+use std::time::Duration;
 use std::{
     fs::File,
     io::Write,
@@ -40,6 +40,7 @@ fn writer_properties_from_format(format: &ParquetFormat) -> (WriterProperties, u
         ParquetCompression::Gzip => parquet::basic::Compression::GZIP(GzipLevel::default()),
         ParquetCompression::Zstd => parquet::basic::Compression::ZSTD(ZstdLevel::default()),
         ParquetCompression::Lz4 => parquet::basic::Compression::LZ4,
+        ParquetCompression::Lz4Raw => parquet::basic::Compression::LZ4_RAW,
     });
 
     (
@@ -91,7 +92,9 @@ pub struct ParquetBatchBufferingWriter {
     buffer: SharedBuffer,
     row_group_size_bytes: usize,
     schema: ArroyoSchemaRef,
+    writer_schema: SchemaRef,
     iceberg_schema: Option<iceberg::spec::SchemaRef>,
+    event_logger: FsEventLogger,
 }
 
 impl BatchBufferingWriter for ParquetBatchBufferingWriter {
@@ -100,6 +103,7 @@ impl BatchBufferingWriter for ParquetBatchBufferingWriter {
         format: Format,
         schema: ArroyoSchemaRef,
         iceberg_schema: Option<iceberg::spec::SchemaRef>,
+        event_logger: FsEventLogger,
     ) -> Self {
         let Format::Parquet(parquet) = format else {
             panic!("ParquetBatchBufferingWriter configured with non-parquet format {format:?}");
@@ -109,9 +113,17 @@ impl BatchBufferingWriter for ParquetBatchBufferingWriter {
 
         let buffer = SharedBuffer::new(row_group_size_bytes);
 
+        let mut writer_schema = schema.schema_without_timestamp();
+        if let Some(iceberg) = &iceberg_schema {
+            writer_schema = update_field_ids_to_iceberg(&writer_schema, iceberg)
+                .expect("failed to assign iceberg ids to schema")
+        };
+
+        let writer_schema = Arc::new(writer_schema);
+
         let writer = ArrowWriter::try_new(
             buffer.clone(),
-            Arc::new(add_parquet_field_ids(&schema.schema_without_timestamp())),
+            writer_schema.clone(),
             Some(writer_properties),
         )
         .unwrap();
@@ -120,8 +132,10 @@ impl BatchBufferingWriter for ParquetBatchBufferingWriter {
             writer: Some(writer),
             buffer,
             row_group_size_bytes,
+            writer_schema,
             schema,
             iceberg_schema,
+            event_logger,
         }
     }
 
@@ -135,11 +149,36 @@ impl BatchBufferingWriter for ParquetBatchBufferingWriter {
         // remove timestamp column
         let mut data = data.clone();
         self.schema.remove_timestamp_column(&mut data);
-        writer.write(&data).unwrap();
 
-        if writer.in_progress_size() > self.row_group_size_bytes {
-            writer.flush().unwrap();
+        if self.iceberg_schema.is_some() {
+            data = normalize_batch_to_schema(&data, &self.writer_schema)
+                .expect("could not normalize batch");
         }
+
+        let prev_size = writer.in_progress_size();
+        writer.write(&data).unwrap();
+        let uncompressed_bytes = writer
+            .in_progress_size()
+            .checked_sub(prev_size)
+            .unwrap_or_default();
+
+        let row_groups = if writer.in_progress_size() > self.row_group_size_bytes {
+            writer.flush().unwrap();
+            1
+        } else {
+            0
+        };
+
+        self.event_logger.log_fs_event(
+            0,
+            0,
+            Duration::ZERO,
+            0,
+            None,
+            row_groups,
+            uncompressed_bytes as u64,
+            data.num_rows() as u64,
+        );
     }
 
     fn buffered_bytes(&self) -> usize {
@@ -257,7 +296,6 @@ impl LocalWriter for ParquetLocalWriter {
                 representative_timestamp: representitive_timestamp(
                     batch.column(self.schema.timestamp_index),
                 )?,
-                part_size: None,
             });
         } else {
             self.stats.as_mut().unwrap().last_write_at = Instant::now();
@@ -321,36 +359,6 @@ impl LocalWriter for ParquetLocalWriter {
     fn stats(&self) -> MultiPartWriterStats {
         self.stats.as_ref().unwrap().clone()
     }
-}
-
-pub(crate) fn batches_by_partition(
-    batch: RecordBatch,
-    partitioner: Arc<dyn PhysicalExpr>,
-) -> Result<Vec<(RecordBatch, Option<String>)>> {
-    let partition = partitioner.evaluate(&batch)?.into_array(batch.num_rows())?;
-    // sort the partition, and then the batch, then compute partitions
-    let sort_indices = sort_to_indices(&partition, None, None)?;
-    let sorted_partition = take(&*partition, &sort_indices, None).unwrap();
-    let sorted_batch = RecordBatch::try_new(
-        batch.schema(),
-        batch
-            .columns()
-            .iter()
-            .map(|col| take(col, &sort_indices, None).unwrap())
-            .collect(),
-    )?;
-    let partition = arrow::compute::partition(&[sorted_partition.clone()])?;
-    let typed_partition = sorted_partition
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let mut result = Vec::with_capacity(partition.len());
-    for partition in partition.ranges() {
-        let partition_string = typed_partition.value(partition.start);
-        let batch = sorted_batch.slice(partition.start, partition.end - partition.start);
-        result.push((batch, Some(partition_string.to_string())));
-    }
-    Ok(result)
 }
 
 pub(crate) fn representitive_timestamp(timestamp_column: &Arc<dyn Array>) -> Result<SystemTime> {

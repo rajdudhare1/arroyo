@@ -4,8 +4,10 @@ pub mod public_ids;
 pub mod schema_resolver;
 pub mod var_str;
 
+use crate::api_types::checkpoints::CheckpointEventSpan;
 use crate::config::{config, TlsConfig};
 use crate::formats::{BadData, Format, Framing};
+use crate::grpc::api::TaskCheckpointDetail;
 use crate::grpc::rpc::controller_grpc_client::ControllerGrpcClient;
 use crate::grpc::rpc::{LoadCompactedDataReq, SubtaskCheckpointMetadata};
 use anyhow::{anyhow, Context, Result};
@@ -33,7 +35,7 @@ use regex::Regex;
 use rustls::RootCertStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::{NonZero, NonZeroU64};
 use std::str::FromStr;
@@ -102,13 +104,7 @@ pub enum EventLevel {
 }
 
 pub trait EventLogger: Send + Sync {
-    fn log_event(
-        &self,
-        name: &str,
-        labels: Value,
-        values: BTreeMap<String, f64>,
-        level: EventLevel,
-    );
+    fn log_event(&self, name: &str, labels: Value, values: Vec<(String, f64)>, level: EventLevel);
     fn trace_enabled(&self) -> bool {
         false
     }
@@ -130,9 +126,9 @@ macro_rules! log_event {
         if let Some(event_logger) = arroyo_rpc::event_logger() {
             let labels = serde_json::json!({ $($labels)* });
             let values = {
-                let mut map = ::std::collections::BTreeMap::new();
+                let mut map = vec![];
                 $(
-                    map.insert($key.to_string(), $value as f64);
+                    map.push(($key.to_string(), $value as f64));
                 )*
                 map
             };
@@ -151,11 +147,11 @@ macro_rules! log_trace_event {
             if event_logger.trace_enabled() {
                 let labels = serde_json::json!({ $($labels)* });
                 let values = {
-                    let mut map = ::std::collections::BTreeMap::new();
+                    let mut fields = vec![];
                     $(
-                        map.insert($key.to_string(), $value as f64);
+                        fields.push(($key.to_string(), $value as f64));
                     )*
-                    map
+                    fields
                 };
                 event_logger.log_event($name, labels, values, arroyo_rpc::EventLevel::Trace);
             }
@@ -594,15 +590,14 @@ impl DataSizeUnit {
 
 pub struct ConnectorOptions {
     options: HashMap<String, Expr>,
+    partitions: Vec<Expr>,
 }
 
-impl TryFrom<&Vec<SqlOption>> for ConnectorOptions {
-    type Error = datafusion::error::DataFusionError;
-
-    fn try_from(value: &Vec<SqlOption>) -> Result<Self, Self::Error> {
+impl ConnectorOptions {
+    pub fn new(sql_opts: &[SqlOption], partition_by: &Option<Vec<Expr>>) -> DFResult<Self> {
         let mut options = HashMap::new();
 
-        for option in value {
+        for option in sql_opts {
             let SqlOption::KeyValue { key, value } = &option else {
                 return plan_err!(
                     "invalid with option: '{}'; expected an `=` delimited key-value pair",
@@ -613,11 +608,16 @@ impl TryFrom<&Vec<SqlOption>> for ConnectorOptions {
             options.insert(key.value.to_string(), value.clone());
         }
 
-        Ok(Self { options })
+        Ok(Self {
+            options,
+            partitions: partition_by.clone().unwrap_or_default(),
+        })
     }
-}
 
-impl ConnectorOptions {
+    pub fn partitions(&self) -> &[Expr] {
+        &self.partitions
+    }
+
     pub fn pull_struct<T: FromOpts>(&mut self) -> DFResult<T> {
         T::from_opts(self)
     }
@@ -1059,6 +1059,102 @@ pub fn local_address(bind_address: IpAddr) -> String {
             format!("[{local_ip}]")
         }
     }
+}
+
+#[derive(Default)]
+pub struct TaskEventSpans {
+    pub alignment: Option<(u64, u64)>,
+    pub sync: Option<(u64, u64)>,
+    pub r#async: Option<(u64, u64)>,
+    pub committing: Option<(u64, u64)>,
+}
+
+impl From<TaskEventSpans> for Vec<CheckpointEventSpan> {
+    fn from(val: TaskEventSpans) -> Self {
+        let mut spans = vec![];
+
+        if let Some((start_time, finish_time)) = val.alignment {
+            spans.push(CheckpointEventSpan {
+                event: "Alignment".to_string(),
+                description: "Time spent waiting for alignment barriers".to_string(),
+                start_time,
+                finish_time,
+            });
+        }
+
+        if let Some((start_time, finish_time)) = val.sync {
+            spans.push(CheckpointEventSpan {
+                event: "Sync".to_string(),
+                description: "The synchronous part of checkpointing".to_string(),
+                start_time,
+                finish_time,
+            });
+        }
+
+        if let Some((start_time, finish_time)) = val.r#async {
+            spans.push(CheckpointEventSpan {
+                event: "Async".to_string(),
+                description: "The asynchronous part of checkpointing".to_string(),
+                start_time,
+                finish_time,
+            });
+        }
+
+        if let Some((start_time, finish_time)) = val.committing {
+            spans.push(CheckpointEventSpan {
+                event: "Committing".to_string(),
+                description: "Committing the checkpoint".to_string(),
+                start_time,
+                finish_time,
+            });
+        }
+
+        spans
+    }
+}
+
+pub fn get_event_spans(subtask_details: &TaskCheckpointDetail) -> TaskEventSpans {
+    let alignment_started = subtask_details
+        .events
+        .iter()
+        .find(|e| e.event_type == grpc::api::TaskCheckpointEventType::AlignmentStarted as i32);
+
+    let checkpoint_started = subtask_details
+        .events
+        .iter()
+        .find(|e| e.event_type == grpc::api::TaskCheckpointEventType::CheckpointStarted as i32);
+
+    let sync_finished = subtask_details.events.iter().find(|e| {
+        e.event_type == grpc::api::TaskCheckpointEventType::CheckpointSyncFinished as i32
+    });
+
+    let pre_commit = subtask_details
+        .events
+        .iter()
+        .find(|e| e.event_type == grpc::api::TaskCheckpointEventType::CheckpointPreCommit as i32);
+
+    let mut event_spans = TaskEventSpans::default();
+
+    if let (Some(alignment_started), Some(checkpoint_started)) =
+        (alignment_started, checkpoint_started)
+    {
+        event_spans.alignment = Some((alignment_started.time, checkpoint_started.time));
+    }
+
+    if let (Some(checkpoint_started), Some(sync_finished)) = (checkpoint_started, sync_finished) {
+        event_spans.sync = Some((checkpoint_started.time, sync_finished.time));
+    }
+
+    if let (Some(async_started), Some(checkpoint_finished)) =
+        (sync_finished, subtask_details.finish_time)
+    {
+        event_spans.r#async = Some((async_started.time, checkpoint_finished));
+    };
+    if let (Some(operator_finished), Some(pre_commit)) = (subtask_details.finish_time, pre_commit) {
+        event_spans.committing = Some((operator_finished, pre_commit.time));
+    }
+
+    event_spans
 }
 
 pub trait FromOpts: Sized {

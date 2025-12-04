@@ -1,35 +1,18 @@
-use ::arrow::{
-    array::StringBuilder,
-    datatypes::{DataType, TimeUnit},
-    record_batch::RecordBatch,
-    util::display::{ArrayFormatter, FormatOptions},
-};
+use ::arrow::record_batch::RecordBatch;
+use ::arrow::row::OwnedRow;
 use anyhow::{bail, Result};
 use arroyo_operator::context::OperatorContext;
-use arroyo_rpc::{df::ArroyoSchemaRef, formats::Format, log_trace_event, TIMESTAMP_FIELD};
+use arroyo_rpc::{df::ArroyoSchemaRef, formats::Format, log_trace_event};
 use arroyo_storage::StorageProvider;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::ScalarFunctionArgs;
-use datafusion::prelude::concat;
-use datafusion::{
-    common::{Column, Result as DFResult},
-    logical_expr::{
-        expr::ScalarFunction, Expr, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
-    },
-    physical_plan::{ColumnarValue, PhysicalExpr},
-    physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
-    scalar::ScalarValue,
-};
 use deltalake::DeltaTable;
 use futures::{stream::FuturesUnordered, Future};
 use futures::{stream::StreamExt, TryStreamExt};
 use object_store::{multipart::PartId, path::Path, MultipartId};
 use std::{
-    any::Any,
     collections::HashMap,
     fmt::{Debug, Formatter},
     marker::PhantomData,
@@ -49,20 +32,20 @@ pub(crate) mod iceberg;
 pub mod json;
 pub mod local;
 pub mod parquet;
+pub(crate) mod partitioning;
 mod two_phase_committer;
+
 use self::{
     json::{JsonLocalWriter, JsonWriter},
     local::LocalFileSystemWriter,
-    parquet::{
-        batches_by_partition, representitive_timestamp, ParquetBatchBufferingWriter,
-        ParquetLocalWriter,
-    },
+    parquet::{representitive_timestamp, ParquetBatchBufferingWriter, ParquetLocalWriter},
 };
 
 use self::iceberg::metadata::IcebergFileMetadata;
-use crate::filesystem::config::{NamingConfig, PartitioningConfig};
+use crate::filesystem::config::NamingConfig;
 use crate::filesystem::sink::delta::load_or_create_table;
 use crate::filesystem::sink::iceberg::IcebergTable;
+use crate::filesystem::sink::partitioning::{Partitioner, PartitionerMode};
 use crate::filesystem::{config, FilenameStrategy, TableFormat};
 use two_phase_committer::{CommitStrategy, TwoPhaseCommitter, TwoPhaseCommitterOperator};
 
@@ -70,12 +53,14 @@ const DEFAULT_TARGET_PART_SIZE: usize = 32 * 1024 * 1024;
 
 pub struct FileSystemSink<BBW: BatchBufferingWriter> {
     sender: Option<Sender<FileSystemMessages>>,
-    partitioner: Option<Arc<dyn PhysicalExpr>>,
     checkpoint_receiver: Option<Receiver<CheckpointData>>,
     table: config::FileSystemSink,
     format: Format,
     table_format: Option<TableFormat>,
     commit_strategy: CommitStrategy,
+    event_logger: FsEventLogger,
+    partitioner_mode: PartitionerMode,
+    partitioner: Option<Arc<Partitioner>>,
     _ts: PhantomData<BBW>,
 }
 
@@ -92,6 +77,8 @@ impl<R: BatchBufferingWriter + Send + 'static> FileSystemSink<R> {
         config: config::FileSystemSink,
         table_format: TableFormat,
         format: Format,
+        partitioner_mode: PartitionerMode,
+        connection_id: Option<String>,
     ) -> TwoPhaseCommitterOperator<Self> {
         TwoPhaseCommitterOperator::new(Self {
             sender: None,
@@ -103,32 +90,43 @@ impl<R: BatchBufferingWriter + Send + 'static> FileSystemSink<R> {
                 TableFormat::Delta | TableFormat::Iceberg(_) => CommitStrategy::PerOperator,
             },
             table_format: Some(table_format),
-
             partitioner: None,
+            partitioner_mode,
+            event_logger: FsEventLogger {
+                task_info: None,
+                connection_id: connection_id.unwrap_or_default().into(),
+            },
             _ts: Default::default(),
         })
     }
 
-    pub async fn start(&mut self, schema: ArroyoSchemaRef) -> Result<()> {
+    pub async fn start(&mut self, task_info: Arc<TaskInfo>, schema: ArroyoSchemaRef) -> Result<()> {
         let (sender, receiver) = tokio::sync::mpsc::channel(10000);
         let (checkpoint_sender, checkpoint_receiver) = tokio::sync::mpsc::channel(10000);
 
+        self.event_logger.task_info = Some(task_info.clone());
         self.sender = Some(sender);
         self.checkpoint_receiver = Some(checkpoint_receiver);
+        self.partitioner = Some(Arc::new(Partitioner::new(
+            self.partitioner_mode.clone(),
+            &schema.schema,
+        )?));
 
-        let partition_func =
-            get_partitioner_from_file_settings(&self.table.partitioning, schema.clone());
-        self.partitioner = partition_func;
         let table = self.table.clone();
         let format = self.format.clone();
 
         let mut table_format = self.table_format.take().expect("table format must be set");
 
         let provider = table_format
-            .get_storage_provider(&self.table, &schema.schema_without_timestamp())
+            .get_storage_provider(
+                task_info.clone(),
+                &self.table,
+                &schema.schema_without_timestamp(),
+            )
             .await?;
 
         let mut writer = AsyncMultipartFileSystemWriter::<R>::new(
+            task_info,
             Arc::new(provider),
             receiver,
             checkpoint_sender,
@@ -136,6 +134,8 @@ impl<R: BatchBufferingWriter + Send + 'static> FileSystemSink<R> {
             table_format,
             format,
             schema,
+            self.event_logger.clone(),
+            self.partitioner.as_ref().unwrap().clone(),
         )
         .await?;
 
@@ -146,133 +146,50 @@ impl<R: BatchBufferingWriter + Send + 'static> FileSystemSink<R> {
     }
 }
 
-fn get_partitioner_from_file_settings(
-    partitioning: &PartitioningConfig,
-    schema: ArroyoSchemaRef,
-) -> Option<Arc<dyn PhysicalExpr>> {
-    match (&partitioning.time_pattern, &partitioning.fields) {
-        (None, fields) if !fields.is_empty() => {
-            Some(partition_string_for_fields(schema, fields).unwrap())
-        }
-        (None, _) => None,
-        (Some(pattern), fields) if !fields.is_empty() => {
-            Some(partition_string_for_fields_and_time(schema, fields, pattern).unwrap())
-        }
-        (Some(pattern), _) => Some(partition_string_for_time(schema, pattern).unwrap()),
+#[derive(Clone)]
+pub(crate) struct FsEventLogger {
+    task_info: Option<Arc<TaskInfo>>,
+    connection_id: Arc<String>,
+}
+
+impl FsEventLogger {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn log_fs_event(
+        &self,
+        bytes: usize,
+        files: u64,
+        write_time: Duration,
+        failures: u64,
+        failure_message: Option<String>,
+        row_groups_written: u64,
+        uncompressed_bytes_written: u64,
+        rows_written: u64,
+    ) {
+        let task_info = self.task_info.as_ref().unwrap();
+        log_trace_event!("filesystem_write",
+        {
+            "operator_id": task_info.operator_id,
+            "operator_name": task_info.operator_name,
+            "connection_id": self.connection_id.as_str(),
+            "write_error_reason": failure_message.as_deref().unwrap_or(""),
+            "subtask_idx": task_info.task_index,
+        }, [
+            "bytes_written" => bytes as f64,
+            "files_written" => files as f64,
+            "write_time_ms" => write_time.as_millis() as f64,
+            "write_failures" => failures as f64,
+            "row_groups_written" => row_groups_written as f64,
+            "uncompressed_bytes_written" => uncompressed_bytes_written as f64,
+            "rows_written" => rows_written as f64,
+        ]);
     }
-}
-
-fn partition_string_for_fields(
-    schema: ArroyoSchemaRef,
-    partition_fields: &[String],
-) -> Result<Arc<dyn PhysicalExpr>> {
-    let function = field_logical_expression(schema.clone(), partition_fields)?;
-    compile_expression(&function, schema)
-}
-
-fn partition_string_for_time(
-    schema: ArroyoSchemaRef,
-    time_partition_pattern: &str,
-) -> Result<Arc<dyn PhysicalExpr>> {
-    let function = timestamp_logical_expression(time_partition_pattern)?;
-    compile_expression(&function, schema)
-}
-
-fn partition_string_for_fields_and_time(
-    schema: ArroyoSchemaRef,
-    partition_fields: &[String],
-    time_partition_pattern: &str,
-) -> Result<Arc<dyn PhysicalExpr>> {
-    let field_function = field_logical_expression(schema.clone(), partition_fields)?;
-    let time_function = timestamp_logical_expression(time_partition_pattern)?;
-    let function = concat(vec![
-        time_function,
-        Expr::Literal(ScalarValue::Utf8(Some("/".to_string())), None),
-        field_function,
-    ]);
-    compile_expression(&function, schema)
-}
-
-fn compile_expression(expr: &Expr, schema: ArroyoSchemaRef) -> Result<Arc<dyn PhysicalExpr>> {
-    let physical_planner = DefaultPhysicalPlanner::default();
-    let session_state = SessionStateBuilder::new().build();
-
-    let plan = physical_planner.create_physical_expr(
-        expr,
-        &(schema.schema.as_ref().clone()).try_into()?,
-        &session_state,
-    )?;
-    Ok(plan)
-}
-
-fn field_logical_expression(schema: ArroyoSchemaRef, partition_fields: &[String]) -> Result<Expr> {
-    let columns_as_string = partition_fields
-        .iter()
-        .map(|field| {
-            let field = schema.schema.field_with_name(field)?;
-            let column_expr = Expr::Column(Column::from_name(field.name().to_string()));
-            let expr = match field.data_type() {
-                DataType::Utf8 => column_expr,
-                _ => Expr::Cast(datafusion::logical_expr::Cast {
-                    expr: Box::new(column_expr),
-                    data_type: DataType::Utf8,
-                }),
-            };
-            Ok((field.name(), expr))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let function = concat(
-        columns_as_string
-            .into_iter()
-            .enumerate()
-            .flat_map(|(i, (name, expr))| {
-                let preamble = if i == 0 {
-                    format!("{name}=")
-                } else {
-                    format!("/{name}=")
-                };
-                vec![Expr::Literal(ScalarValue::Utf8(Some(preamble)), None), expr]
-            })
-            .collect(),
-    );
-    Ok(function)
-}
-
-fn timestamp_logical_expression(time_partition_pattern: &str) -> Result<Expr> {
-    let udf = TimestampFormattingUDF::new(time_partition_pattern.to_string());
-    let scalar_function = ScalarFunction::new_udf(
-        Arc::new(ScalarUDF::new_from_impl(udf)),
-        vec![Expr::Column(Column::from_name(TIMESTAMP_FIELD))],
-    );
-    let function = Expr::ScalarFunction(scalar_function);
-    Ok(function)
-}
-
-pub(crate) fn log_fs_event(
-    task_info: &TaskInfo,
-    bytes: usize,
-    files: u64,
-    write_time: Duration,
-    failures: u64,
-) {
-    log_trace_event!("filesystem_write",
-    {
-        "operator_id": task_info.operator_id,
-        "operator_name": task_info.operator_name,
-        "subtask_idx": task_info.task_index,
-    }, [
-        "bytes_written" => bytes as f64,
-        "files_written" => files as f64,
-        "write_time_ms" => write_time.as_millis() as f64,
-        "write_failures" => failures as f64
-    ]);
 }
 
 #[derive(Debug)]
 enum FileSystemMessages {
     Data {
         value: RecordBatch,
-        partition: Option<String>,
+        partition: Option<OwnedRow>,
     },
     Init {
         max_file_index: usize,
@@ -284,7 +201,10 @@ enum FileSystemMessages {
         watermark: Option<SystemTime>,
         then_stop: bool,
     },
-    FilesToFinish(Vec<FileToFinish>),
+    FilesToFinish {
+        files: Vec<FileToFinish>,
+        epoch: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -299,6 +219,7 @@ enum CheckpointData {
 #[derive(Decode, Encode, Clone, PartialEq, Eq)]
 struct InProgressFileCheckpoint {
     filename: String,
+    // unused, retained for backwards compatibility
     partition: Option<String>,
     data: FileCheckpointData,
     pushed_size: usize,
@@ -432,7 +353,7 @@ pub enum InFlightPartCheckpoint {
 }
 
 struct AsyncMultipartFileSystemWriter<BBW: BatchBufferingWriter> {
-    active_writers: HashMap<Option<String>, String>,
+    active_writers: HashMap<Option<OwnedRow>, String>,
     watermark: Option<SystemTime>,
     max_file_index: usize,
     task_info: Option<Arc<TaskInfo>>,
@@ -449,6 +370,8 @@ struct AsyncMultipartFileSystemWriter<BBW: BatchBufferingWriter> {
     format: Format,
     schema: ArroyoSchemaRef,
     iceberg_schema: Option<::iceberg::spec::SchemaRef>,
+    event_logger: FsEventLogger,
+    partitioner: Arc<Partitioner>,
 }
 
 #[derive(Debug)]
@@ -461,13 +384,26 @@ pub enum CommitState {
     VanillaParquet,
 }
 
+impl CommitState {
+    fn name(&self) -> &'static str {
+        match self {
+            CommitState::DeltaLake { .. } => "delta",
+            CommitState::Iceberg(_) => "iceberg",
+            CommitState::VanillaParquet => "none",
+        }
+    }
+}
+
 async fn from_checkpoint(
     path: &Path,
-    partition: Option<String>,
     checkpoint_data: FileCheckpointData,
     mut pushed_size: usize,
     object_store: Arc<StorageProvider>,
+    target_multipart_size: usize,
 ) -> Result<Option<FileToFinish>> {
+    // TODO: this recovery code duplicates some complex and important logic from
+    //  BatchMultipartWriter / MultipartManager and it would be good in the future to unify them
+
     let mut parts = vec![];
     let (multipart_id, metadata) = match checkpoint_data {
         FileCheckpointData::Empty => {
@@ -483,6 +419,7 @@ async fn from_checkpoint(
                 .start_multipart(path)
                 .await
                 .expect("failed to create multipart upload");
+
             for (part_index, data) in parts_to_add.into_iter().enumerate() {
                 pushed_size += data.len();
                 let upload_part = object_store
@@ -490,19 +427,24 @@ async fn from_checkpoint(
                     .await?;
                 parts.push(upload_part);
             }
-            if let Some(trailing_bytes) = trailing_bytes {
-                pushed_size += trailing_bytes.len();
-                let upload_part = object_store
-                    .add_multipart(path, &multipart_id, parts.len(), trailing_bytes.into())
-                    .await?;
-                parts.push(upload_part);
-            }
+
+            pushed_size += write_trailing_bytes(
+                path,
+                &object_store,
+                &mut parts,
+                trailing_bytes,
+                &multipart_id,
+                target_multipart_size,
+            )
+            .await?;
+
             debug!(
                 "parts: {:?}, pushed_size: {:?}, multipart id: {:?}",
                 parts, pushed_size, multipart_id
             );
             (multipart_id, metadata)
         }
+
         FileCheckpointData::MultiPartInFlight {
             multi_part_upload_id,
             in_flight_parts,
@@ -523,18 +465,22 @@ async fn from_checkpoint(
                     }
                 }
             }
-            if let Some(trailing_bytes) = trailing_bytes {
-                pushed_size += trailing_bytes.len();
-                let upload_part = object_store
-                    .add_multipart(
-                        path,
-                        &multi_part_upload_id,
-                        parts.len(),
-                        trailing_bytes.into(),
-                    )
-                    .await?;
-                parts.push(upload_part);
-            }
+
+            pushed_size += write_trailing_bytes(
+                path,
+                &object_store,
+                &mut parts,
+                trailing_bytes,
+                &multi_part_upload_id,
+                target_multipart_size,
+            )
+            .await?;
+
+            debug!(
+                "parts: {:?}, pushed_size: {:?}, multipart id: {:?}",
+                parts, pushed_size, multi_part_upload_id
+            );
+
             (multi_part_upload_id, metadata)
         }
         FileCheckpointData::MultiPartWriterClosed {
@@ -572,7 +518,7 @@ async fn from_checkpoint(
     };
     Ok(Some(FileToFinish {
         filename: path.to_string(),
-        partition,
+        partition: None,
         multi_part_upload_id: multipart_id,
         completed_parts: parts.into_iter().map(|p| p.content_id).collect(),
         size: pushed_size,
@@ -580,9 +526,57 @@ async fn from_checkpoint(
     }))
 }
 
+async fn write_trailing_bytes(
+    path: &Path,
+    object_store: &Arc<StorageProvider>,
+    parts: &mut Vec<PartId>,
+    trailing_bytes: Option<Vec<u8>>,
+    multipart_id: &MultipartId,
+    multipart_upload_size: usize,
+) -> Result<usize> {
+    let mut pushed_size = 0;
+    if let Some(trailing_bytes) = trailing_bytes {
+        pushed_size += trailing_bytes.len();
+
+        if object_store.requires_same_part_sizes()
+            && !parts.is_empty()
+            && trailing_bytes.len() > multipart_upload_size
+        {
+            // our last part is bigger than our part size, which isn't allowed by some object stores
+            // so we need to split it up
+            debug!(
+                "final multipart upload ({}) is bigger than part size ({}) so splitting into two",
+                trailing_bytes.len(),
+                multipart_upload_size
+            );
+            let mut part1: Bytes = trailing_bytes.into();
+            let part2 = part1.split_off(multipart_upload_size);
+
+            parts.push(
+                object_store
+                    .add_multipart(path, multipart_id, parts.len(), part1)
+                    .await?,
+            );
+            parts.push(
+                object_store
+                    .add_multipart(path, multipart_id, parts.len(), part2)
+                    .await?,
+            );
+        } else {
+            parts.push(
+                object_store
+                    .add_multipart(path, multipart_id, parts.len(), trailing_bytes.into())
+                    .await?,
+            );
+        }
+    }
+    Ok(pushed_size)
+}
+
 #[derive(Debug, Clone, Encode, Decode, PartialEq, Eq)]
 pub struct FileToFinish {
     filename: String,
+    // unused -- retained for backwards compatibility
     partition: Option<String>,
     multi_part_upload_id: String,
     completed_parts: Vec<String>,
@@ -593,6 +587,7 @@ pub struct FileToFinish {
 #[derive(Debug, Clone, Encode, Decode, PartialEq, Eq)]
 pub struct FinishedFile {
     filename: String,
+    // unused, retained for backwards compatibility
     partition: Option<String>,
     size: usize,
     metadata: Option<IcebergFileMetadata>,
@@ -670,7 +665,6 @@ impl RollingPolicy {
 pub struct MultiPartWriterStats {
     bytes_written: usize,
     parts_written: usize,
-    part_size: Option<usize>,
     last_write_at: Instant,
     first_write_at: Instant,
     representative_timestamp: SystemTime,
@@ -680,7 +674,9 @@ impl<BBW> AsyncMultipartFileSystemWriter<BBW>
 where
     BBW: BatchBufferingWriter,
 {
+    #[allow(clippy::too_many_arguments)]
     async fn new(
+        task_info: Arc<TaskInfo>,
         object_store: Arc<StorageProvider>,
         receiver: Receiver<FileSystemMessages>,
         checkpoint_sender: Sender<CheckpointData>,
@@ -688,6 +684,8 @@ where
         table_format: TableFormat,
         format: Format,
         schema: ArroyoSchemaRef,
+        event_logger: FsEventLogger,
+        partitioner: Arc<Partitioner>,
     ) -> Result<Self> {
         let mut iceberg_schema = None;
         let commit_state = match table_format {
@@ -699,7 +697,7 @@ where
             },
             TableFormat::None => CommitState::VanillaParquet,
             TableFormat::Iceberg(mut table) => {
-                let t = table.load_or_create(&schema.schema).await?;
+                let t = table.load_or_create(task_info, &schema.schema).await?;
                 iceberg_schema = Some(t.metadata().current_schema().clone());
                 CommitState::Iceberg(table)
             }
@@ -728,6 +726,8 @@ where
             format,
             schema,
             iceberg_schema,
+            event_logger,
+            partitioner,
         })
     }
 
@@ -753,10 +753,11 @@ where
                             for recovered_file in recovered_files {
                                 let file_to_finish = from_checkpoint(
                                     &Path::parse(&recovered_file.filename)?,
-                                    recovered_file.partition.clone(),
                                     recovered_file.data,
                                     recovered_file.pushed_size,
-                                    self.object_store.clone()).await?;
+                                    self.object_store.clone(),
+                                    self.properties.multipart.target_part_size_bytes.unwrap_or(DEFAULT_TARGET_PART_SIZE as u64) as usize,
+                                ).await?;
 
                                 if let Some(file_to_finish) = file_to_finish {
                                     debug!("adding file to finish: {:?}", file_to_finish);
@@ -775,8 +776,8 @@ where
                             self.checkpoint_sender.send({CheckpointData::Finished {  max_file_index: self.max_file_index,
                             delta_version}}).await?;
                         },
-                        FileSystemMessages::FilesToFinish(files_to_finish) =>{
-                            self.finish_files(files_to_finish).await?;
+                        FileSystemMessages::FilesToFinish{ files, epoch }  =>{
+                            self.finish_files(epoch, files).await?;
                         }
                     }
                 }
@@ -828,7 +829,7 @@ where
 
     fn get_or_insert_writer(
         &mut self,
-        partition: &Option<String>,
+        partition: &Option<OwnedRow>,
     ) -> &mut BatchMultipartWriter<BBW> {
         if !self.active_writers.contains_key(partition) {
             let new_writer = self.new_writer(partition);
@@ -841,7 +842,7 @@ where
             .unwrap()
     }
 
-    fn new_writer(&mut self, partition: &Option<String>) -> BatchMultipartWriter<BBW> {
+    fn new_writer(&mut self, partition: &Option<OwnedRow>) -> BatchMultipartWriter<BBW> {
         let filename_strategy = self.file_naming.strategy.unwrap_or_default();
 
         // This forms the base for naming files depending on strategy
@@ -858,26 +859,26 @@ where
             FilenameStrategy::UuidV7 => Uuid::now_v7().to_string(),
         };
 
-        let filename = add_suffix_prefix(
+        let mut filename = add_suffix_prefix(
             filename_base,
             self.file_naming.prefix.as_ref(),
             self.file_naming.suffix.as_ref().unwrap(),
         );
 
-        let path = match partition {
-            Some(sub_bucket) => format!("{sub_bucket}/{filename}"),
-            None => filename.clone(),
-        };
+        if let Some(partition) = partition {
+            if let Some(hive) = self.partitioner.hive_path(partition) {
+                filename = format!("{hive}/{filename}");
+            }
+        }
 
         BatchMultipartWriter::new(
             self.object_store.clone(),
-            path.into(),
-            partition.clone(),
+            filename.into(),
             &self.properties,
             self.format.clone(),
             self.schema.clone(),
-            self.task_info.clone().unwrap(),
             self.iceberg_schema.clone(),
+            self.event_logger.clone(),
         )
     }
 
@@ -922,13 +923,22 @@ where
         }
     }
 
-    async fn finish_files(&mut self, files_to_finish: Vec<FileToFinish>) -> Result<()> {
+    async fn finish_files(&mut self, epoch: u32, files_to_finish: Vec<FileToFinish>) -> Result<()> {
+        debug!(
+            message = "finishing files",
+            number_of_files = files_to_finish.len()
+        );
         let mut finished_files: Vec<FinishedFile> = vec![];
         for file_to_finish in files_to_finish {
             if let Some(file) = self.finish_file(file_to_finish).await? {
                 finished_files.push(file);
             }
         }
+
+        debug!(
+            message = "starting commit",
+            commit_type = self.commit_state.name()
+        );
 
         match &mut self.commit_state {
             CommitState::DeltaLake {
@@ -942,12 +952,17 @@ where
                 }
             }
             CommitState::Iceberg(table) => {
-                table.commit(&finished_files).await?;
+                table.commit(epoch, &finished_files).await?;
             }
             CommitState::VanillaParquet => {
                 // nothing to do
             }
         }
+
+        debug!(
+            message = "finished commit",
+            commit_type = self.commit_state.name()
+        );
 
         let finished_message = CheckpointData::Finished {
             max_file_index: self.max_file_index,
@@ -987,17 +1002,27 @@ where
             .await
         {
             Ok(_) => {
-                log_fs_event(self.task_info.as_ref().unwrap(), 0, 1, start.elapsed(), 0);
+                self.event_logger
+                    .log_fs_event(0, 1, start.elapsed(), 0, None, 0, 0, 0);
 
                 Ok(Some(FinishedFile {
                     filename: file.filename,
-                    partition: file.partition,
+                    partition: None,
                     size: file.size,
                     metadata: file.metadata,
                 }))
             }
             Err(err) => {
-                log_fs_event(self.task_info.as_ref().unwrap(), 0, 0, start.elapsed(), 1);
+                self.event_logger.log_fs_event(
+                    0,
+                    0,
+                    start.elapsed(),
+                    1,
+                    Some(err.to_string()),
+                    0,
+                    0,
+                    0,
+                );
 
                 // check if the file is already there with the correct size.
                 if let Some(contents) = self.object_store.get_if_present(location).await? {
@@ -1051,7 +1076,7 @@ where
             let in_progress_checkpoint =
                 CheckpointData::InProgressFileCheckpoint(InProgressFileCheckpoint {
                     filename: filename.clone(),
-                    partition: writer.partition(),
+                    partition: None,
                     data,
                     pushed_size: writer.stats().as_ref().unwrap().bytes_written,
                 });
@@ -1062,7 +1087,7 @@ where
                 .send(CheckpointData::InProgressFileCheckpoint(
                     InProgressFileCheckpoint {
                         filename: file_to_finish.filename,
-                        partition: file_to_finish.partition,
+                        partition: None,
                         data: FileCheckpointData::MultiPartWriterUploadCompleted {
                             multi_part_upload_id: file_to_finish.multi_part_upload_id,
                             completed_parts: file_to_finish.completed_parts,
@@ -1083,34 +1108,31 @@ type BoxedTryFuture<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
 struct MultipartManager {
     storage_provider: Arc<StorageProvider>,
     location: Path,
-    partition: Option<String>,
     multipart_id: Option<MultipartId>,
     pushed_parts: Vec<PartIdOrBufferedData>,
     uploaded_parts: usize,
     pushed_size: usize,
     parts_to_add: Vec<PartToUpload>,
     closed: bool,
-    task_info: Arc<TaskInfo>,
+    event_logger: FsEventLogger,
 }
 
 impl MultipartManager {
     fn new(
         object_store: Arc<StorageProvider>,
         location: Path,
-        partition: Option<String>,
-        task_info: Arc<TaskInfo>,
+        event_logger: FsEventLogger,
     ) -> Self {
         Self {
             storage_provider: object_store,
             location,
-            partition,
             multipart_id: None,
             pushed_parts: vec![],
             uploaded_parts: 0,
             pushed_size: 0,
             parts_to_add: vec![],
             closed: false,
-            task_info,
+            event_logger,
         }
     }
 
@@ -1122,6 +1144,11 @@ impl MultipartManager {
         &mut self,
         data: Bytes,
     ) -> Result<Option<BoxedTryFuture<MultipartCallbackWithName>>> {
+        debug!(
+            message = "writing multipart",
+            size = data.len(),
+            id = self.multipart_id
+        );
         match &self.multipart_id {
             Some(_multipart_id) => Ok(Some(self.get_part_upload_future(PartToUpload {
                 part_index: self.pushed_parts.len(),
@@ -1160,7 +1187,7 @@ impl MultipartManager {
             .ok_or_else(|| anyhow::anyhow!("missing multipart id"))?;
         let object_store = self.storage_provider.clone();
 
-        let task_info = self.task_info.clone();
+        let event_logger = self.event_logger.clone();
         Ok(Box::pin(async move {
             let start = Instant::now();
             let bytes = part_to_upload.byte_data.len();
@@ -1174,11 +1201,10 @@ impl MultipartManager {
                 .await;
             let elapsed = start.elapsed();
 
-            if upload_part.is_ok() {
-                log_fs_event(&task_info, bytes, 0, elapsed, 0);
-            } else {
-                log_fs_event(&task_info, 0, 0, elapsed, 1);
-            }
+            match &upload_part {
+                Ok(_) => event_logger.log_fs_event(bytes, 0, elapsed, 0, None, 0, 0, 0),
+                Err(e) => event_logger.log_fs_event(0, 0, elapsed, 1, Some(e.to_string()), 0, 0, 0),
+            };
 
             Ok(MultipartCallbackWithName {
                 name: location.to_string(),
@@ -1230,7 +1256,7 @@ impl MultipartManager {
         } else {
             Ok(Some(FileToFinish {
                 filename: self.name(),
-                partition: self.partition.clone(),
+                partition: None,
                 multi_part_upload_id: self
                     .multipart_id
                     .as_ref()
@@ -1373,7 +1399,7 @@ impl MultipartManager {
         }
         FileToFinish {
             filename: self.name(),
-            partition: self.partition.clone(),
+            partition: None,
             multi_part_upload_id: self
                 .multipart_id
                 .as_ref()
@@ -1401,6 +1427,7 @@ pub trait BatchBufferingWriter: Send {
         format: Format,
         schema: ArroyoSchemaRef,
         iceberg_schema: Option<::iceberg::spec::SchemaRef>,
+        event_logger: FsEventLogger,
     ) -> Self;
     fn suffix() -> String;
     fn add_batch_data(&mut self, data: &RecordBatch);
@@ -1434,18 +1461,23 @@ impl<BBW: BatchBufferingWriter> BatchMultipartWriter<BBW> {
     fn new(
         object_store: Arc<StorageProvider>,
         path: Path,
-        partition: Option<String>,
         config: &config::FileSystemSink,
         format: Format,
         schema: ArroyoSchemaRef,
-        task_info: Arc<TaskInfo>,
         iceberg_schema: Option<::iceberg::spec::SchemaRef>,
+        event_logger: FsEventLogger,
     ) -> Self {
-        let batch_buffering_writer = BBW::new(config, format, schema.clone(), iceberg_schema);
+        let batch_buffering_writer = BBW::new(
+            config,
+            format,
+            schema.clone(),
+            iceberg_schema,
+            event_logger.clone(),
+        );
 
         Self {
             batch_buffering_writer,
-            multipart_manager: MultipartManager::new(object_store, path, partition, task_info),
+            multipart_manager: MultipartManager::new(object_store, path, event_logger),
             stats: None,
             schema,
             target_part_size_bytes: config
@@ -1461,10 +1493,6 @@ impl<BBW: BatchBufferingWriter> BatchMultipartWriter<BBW> {
         self.multipart_manager.name()
     }
 
-    fn partition(&self) -> Option<String> {
-        self.multipart_manager.partition.clone()
-    }
-
     async fn insert_batch(
         &mut self,
         batch: RecordBatch,
@@ -1475,7 +1503,6 @@ impl<BBW: BatchBufferingWriter> BatchMultipartWriter<BBW> {
             self.stats = Some(MultiPartWriterStats {
                 bytes_written: 0,
                 parts_written: 0,
-                part_size: None,
                 last_write_at: Instant::now(),
                 first_write_at: Instant::now(),
                 representative_timestamp,
@@ -1487,21 +1514,14 @@ impl<BBW: BatchBufferingWriter> BatchMultipartWriter<BBW> {
 
         self.batch_buffering_writer.add_batch_data(&batch);
 
-        let bytes = match stats.part_size {
-            None => {
-                if self.batch_buffering_writer.buffered_bytes() >= self.target_part_size_bytes {
-                    let buf = self
-                        .batch_buffering_writer
-                        .split_to(self.target_part_size_bytes);
-                    assert!(!buf.is_empty(), "Trying to write empty part file");
-                    stats.part_size = Some(buf.len());
-                    Some(buf)
-                } else {
-                    None
-                }
-            }
-            Some(part_size) => (self.batch_buffering_writer.buffered_bytes() >= part_size)
-                .then(|| self.batch_buffering_writer.split_to(part_size)),
+        let bytes = if self.batch_buffering_writer.buffered_bytes() >= self.target_part_size_bytes {
+            let buf = self
+                .batch_buffering_writer
+                .split_to(self.target_part_size_bytes);
+            assert!(!buf.is_empty(), "Trying to write empty part file");
+            Some(buf)
+        } else {
+            None
         };
 
         if let Some(bytes) = bytes {
@@ -1557,6 +1577,20 @@ impl<BBW: BatchBufferingWriter> BatchMultipartWriter<BBW> {
     }
 }
 
+fn split_into_parts(mut bytes: Bytes, part_size: usize) -> Vec<Bytes> {
+    let mut parts = Vec::new();
+    while bytes.len() > part_size {
+        let mut part = bytes;
+        let remainder = part.split_off(part_size);
+        parts.push(part);
+        bytes = remainder;
+    }
+    if !bytes.is_empty() {
+        parts.push(bytes);
+    }
+    parts
+}
+
 impl<BBW: BatchBufferingWriter> BatchMultipartWriter<BBW> {
     fn write_closing_multipart(
         &mut self,
@@ -1565,7 +1599,13 @@ impl<BBW: BatchBufferingWriter> BatchMultipartWriter<BBW> {
 
         if let Some((bytes, metadata)) = self.batch_buffering_writer.close(None) {
             self.metadata = metadata;
-            let existing_part_size = self.stats.as_ref().and_then(|s| s.part_size);
+            let existing_part_size = self.stats.as_ref().and_then(|s| {
+                if s.bytes_written > 0 {
+                    Some(self.target_part_size_bytes)
+                } else {
+                    None
+                }
+            });
 
             if self
                 .multipart_manager
@@ -1577,14 +1617,17 @@ impl<BBW: BatchBufferingWriter> BatchMultipartWriter<BBW> {
                 // our last part is bigger than our part size, which isn't allowed by some object stores
                 // so we need to split it up
                 let part_size = existing_part_size.unwrap();
-                debug!("final multipart upload ({}) is bigger than part size ({}) so splitting into two",
-                    bytes.len(), part_size);
-                let mut part1 = bytes;
-                let part2 = part1.split_off(part_size);
-                // these can't be None, so safe to unwrap
-                let f1 = self.multipart_manager.write_next_part(part1)?.unwrap();
-                let f2 = self.multipart_manager.write_next_part(part2)?.unwrap();
-                Ok(vec![f1, f2])
+                let len = bytes.len();
+
+                let parts = split_into_parts(bytes, part_size);
+
+                debug!("final multipart upload ({}) is bigger than part size ({}) so splitting into {}",
+                    len, part_size, parts.len());
+
+                parts
+                    .into_iter()
+                    .map(|part| Ok(self.multipart_manager.write_next_part(part)?.unwrap()))
+                    .collect()
             } else {
                 Ok(self
                     .multipart_manager
@@ -1674,7 +1717,11 @@ impl<R: BatchBufferingWriter + Send + 'static> TwoPhaseCommitter for FileSystemS
         ctx: &mut OperatorContext,
         data_recovery: Vec<Self::DataRecovery>,
     ) -> Result<()> {
-        self.start(ctx.in_schemas.first().unwrap().clone()).await?;
+        self.start(
+            ctx.task_info.clone(),
+            ctx.in_schemas.first().unwrap().clone(),
+        )
+        .await?;
 
         let mut max_file_index = 0;
         let mut recovered_files = Vec::new();
@@ -1701,29 +1748,25 @@ impl<R: BatchBufferingWriter + Send + 'static> TwoPhaseCommitter for FileSystemS
     }
 
     async fn insert_batch(&mut self, record: RecordBatch) -> Result<()> {
-        // TODO: implement partitioning
-        match &self.partitioner {
-            None => {
+        if !self.partitioner.as_ref().unwrap().is_partitioned() {
+            self.sender
+                .as_ref()
+                .unwrap()
+                .send(FileSystemMessages::Data {
+                    value: record,
+                    partition: None,
+                })
+                .await?;
+        } else {
+            for (partition, batch) in self.partitioner.as_ref().unwrap().partition(&record)? {
                 self.sender
                     .as_ref()
                     .unwrap()
                     .send(FileSystemMessages::Data {
-                        value: record,
-                        partition: None,
+                        value: batch,
+                        partition: Some(partition),
                     })
                     .await?;
-            }
-            Some(partitioner) => {
-                for (batch, partition) in batches_by_partition(record, partitioner.clone())? {
-                    self.sender
-                        .as_ref()
-                        .unwrap()
-                        .send(FileSystemMessages::Data {
-                            value: batch,
-                            partition,
-                        })
-                        .await?;
-                }
             }
         }
         Ok(())
@@ -1731,13 +1774,17 @@ impl<R: BatchBufferingWriter + Send + 'static> TwoPhaseCommitter for FileSystemS
 
     async fn commit(
         &mut self,
+        epoch: u32,
         _task_info: &TaskInfo,
         pre_commit: Vec<Self::PreCommit>,
     ) -> Result<()> {
         self.sender
             .as_ref()
             .unwrap()
-            .send(FileSystemMessages::FilesToFinish(pre_commit))
+            .send(FileSystemMessages::FilesToFinish {
+                files: pre_commit,
+                epoch,
+            })
             .await?;
         // loop over checkpoint receiver until finished received
         if let Some(checkpoint_message) = self.checkpoint_receiver.as_mut().unwrap().recv().await {
@@ -1803,7 +1850,7 @@ impl<R: BatchBufferingWriter + Send + 'static> TwoPhaseCommitter for FileSystemS
                             filename.clone(),
                             FileToFinish {
                                 filename,
-                                partition,
+                                partition: None,
                                 multi_part_upload_id,
                                 completed_parts,
                                 size: pushed_size,
@@ -1836,62 +1883,32 @@ pub(crate) fn add_suffix_prefix(
     }
 }
 
-#[derive(Debug)]
-pub struct TimestampFormattingUDF {
-    // TODO: figure out how to manage this with lifetimes.
-    pattern: String,
-    signature: Signature,
-}
+#[cfg(test)]
+mod tests {
+    use crate::filesystem::sink::split_into_parts;
+    use bytes::Bytes;
 
-impl TimestampFormattingUDF {
-    // Initialization method
-    pub fn new(pattern: String) -> Self {
-        TimestampFormattingUDF {
-            pattern,
-            signature: Signature::new(
-                TypeSignature::Exact(vec![DataType::Timestamp(TimeUnit::Nanosecond, None)]),
-                Volatility::Immutable,
-            ),
-        }
-    }
-}
+    #[test]
+    fn test_split_into_parts() {
+        let data: Bytes = (0..10).collect();
+        let parts = split_into_parts(data.clone(), 3);
 
-impl ScalarUDFImpl for TimestampFormattingUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0], vec![0, 1, 2]);
+        assert_eq!(parts[1], vec![3, 4, 5]);
+        assert_eq!(parts[2], vec![6, 7, 8]);
+        assert_eq!(parts[3], vec![9]);
 
-    fn name(&self) -> &str {
-        "partitioning_formatter"
-    }
+        let combined: Vec<u8> = parts.concat();
+        assert_eq!(combined, data);
 
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+        let data: Bytes = vec![1, 2].into();
+        let parts = split_into_parts(data.clone(), 10);
+        assert_eq!(parts, vec![data]);
 
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let args = args.args;
-        let (array, scalar) = match &args[0] {
-            ColumnarValue::Array(array) => (array.clone(), false),
-            ColumnarValue::Scalar(scalar) => (scalar.to_array_of_size(1)?, true),
-        };
-        let items = array.len();
-        let mut result = StringBuilder::with_capacity(items, 20 * items);
-        let format_options = FormatOptions::new().with_timestamp_format(Some(&self.pattern));
-        let formatter = ArrayFormatter::try_new(array.as_ref(), &format_options)?;
-        for i in 0..items {
-            result.append_value(format!("{}", formatter.value(i)));
-        }
-        if scalar {
-            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-                result.finish().value(0).to_string(),
-            ))))
-        } else {
-            Ok(ColumnarValue::Array(Arc::new(result.finish())))
-        }
+        let data: Bytes = (0..6).collect();
+        let parts = split_into_parts(data.clone(), 3);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.concat(), data);
     }
 }

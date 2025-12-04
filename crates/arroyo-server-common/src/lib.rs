@@ -18,7 +18,6 @@ use profile::handle_get_profile;
 use prometheus::{register_int_counter, Encoder, IntCounter, ProtobufEncoder, TextEncoder};
 use reqwest::Client;
 use serde_json::{json, Number, Value};
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::future::Future;
@@ -49,7 +48,7 @@ use uuid::Uuid;
 
 pub const BUILD_TIMESTAMP: &str = env!("VERGEN_BUILD_TIMESTAMP");
 pub const GIT_SHA: &str = env!("VERGEN_GIT_SHA");
-pub const VERSION: &str = "0.15.0-dev";
+pub const VERSION: &str = "0.16.0-dev";
 
 static CLUSTER_ID: OnceCell<String> = OnceCell::new();
 
@@ -200,7 +199,7 @@ impl EventLogger for AnalyticsEventLogger {
         &self,
         name: &str,
         mut labels: Value,
-        values: BTreeMap<String, f64>,
+        values: Vec<(String, f64)>,
         level: EventLevel,
     ) {
         if level != EventLevel::Analytics {
