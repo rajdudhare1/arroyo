@@ -21,7 +21,7 @@ jobs:
           pnpm check
           
   build-rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04-32
     env:
       DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
     steps:
@@ -119,7 +119,7 @@ jobs:
           cargo nextest run --package integ -E 'kind(test)'
           
   build-console:
-    runs-on: 22.04-32
+    runs-on: ubuntu-22.04-32
     steps:
       - name: Check out
         uses: actions/checkout@v3
